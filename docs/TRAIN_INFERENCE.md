@@ -25,10 +25,43 @@ The default training configuration is defined in `humanoidverse/train.py`:
 - `--data-path`: `humanoidverse/data/lafan_29dof_10s-clipped.pkl`.
 - `--work-dir`: `runs/ufo`.
 - `--checkpoint-every-steps`: `3200000` global environment steps.
-- `--buffer-size`: `5120000` transitions per GPU.
+- `--buffer-size`: `5120000` transitions per training rank.
+- `--buffer-storage`: `cpu`; alternatives are `memmap` and `cuda`.
+- `--buffer-prefetch`: `2` batches staged ahead of the optimizer.
+- `--buffer-pin-memory-threads`: `2` threads for page-locking sampled batches.
+- `--gpu-native-rollout`: enabled; MJLab observations/actions remain on CUDA.
+- `--runtime-timing-every`: `0`; set a positive sampling interval to report the runtime breakdown.
 - `--update-z-every-step`: defaults to `100` for FB and `10` for TeCH.
 
 All of these can be overridden from the command line.
+
+## Replay storage
+
+The default TorchRL replay keeps the full online and expert datasets in CPU
+RAM, reconstructs valid one-step transitions with `SliceSampler`, and
+prefetches pinned TensorDict minibatches to the training GPU. This avoids a
+full-capacity CUDA allocation while overlapping most sampling and PCIe transfer
+work with the preceding optimizer update.
+
+For current G1 FB observations, a 5.12-million-frame online buffer is about
+24.7 GiB per rank before expert-data and process overhead. Use
+`--buffer-storage memmap` with fast local NVMe if aggregate host RAM is
+insufficient, especially for multi-GPU runs. The memmap directory is
+`<work-dir>/replay_memmap/rank_<rank>`. `--buffer-storage cuda` remains
+available for small-buffer performance comparisons.
+
+Run the storage microbenchmark with:
+
+```bash
+uv run python scripts/benchmark_replay.py --storage all --batch-size 1024
+```
+
+Compare the legacy NumPy rollout path with the GPU-native path using the real
+MJLab carry environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/benchmark_rollout.py --num-envs 1024 --steps 30
+```
 
 ## FB Training
 
@@ -40,6 +73,70 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --use-wandb \
   --wandb-run-name ufo_fb_8gpu
 ```
+
+### Optional G1 carry-box task
+
+`--task carry_box` enables an isolated MJLab task extension with a 0.5 kg
+rigid box and goal marker. If no data argument is supplied, training uses
+`configs/data/lafan_g1_largebox.yaml`: full LaFAN at weight 0.70 and all paired
+G1/large-box trajectories at weight 0.30. The box observation conditions the
+actor, F, critic, and auxiliary critic, but is deliberately excluded from the
+Backward/z encoder and style discriminator.
+
+Initialize model weights from the existing locomotion run while starting a new
+optimizer, replay, and step counter:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+./run_train.sh \
+  --agent fb \
+  --task carry_box \
+  --gpu-ids all \
+  --num-envs 1024 \
+  --num-env-steps 192000000 \
+  --work-dir runs/ufo_fb_g1_carry_box \
+  --init-from runs/ufo_fb_g1/checkpoint \
+  --update-z-every-step 100 \
+  --buffer-size 5120000
+```
+
+The repository includes the processed full and near-10-second G1/large-box
+PKLs under `humanoidverse/data/`; `configs/data/lafan_g1_largebox.yaml` points
+to those portable paths and does not depend on a machine-local source folder.
+
+For one 32 GiB RTX 5090, keep the 5.12-million-frame replay in host RAM. This
+machine profile keeps the already-tested 1024 environments and samples a timing
+breakdown every 25 rollout iterations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
+```
+
+For eight H200 GPUs, each rank can keep its replay directly on its local GPU.
+This removes the rollout-to-replay CPU copy and does not need CPU prefetching.
+`--buffer-size` is per rank, so the command below uses 5.12 million frames on
+each H200. Distributed `torch.compile` remains auto-disabled for the stable
+profile; add `--compile` only after the H200 smoke run passes. Inductor and
+Triton temporary caches are isolated per rank when compilation is enabled.
+At this capacity, replay checkpoints are roughly 25 GiB per rank (about 200
+GiB across eight ranks), so provision local checkpoint storage accordingly.
+Use `--buffer-size 640000` if a 5.12-million-frame aggregate replay is desired
+instead, recognizing that this shortens each rank's local replay horizon.
+
+First verify the eight-worker/NCCL path with the bounded smoke profile:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
+```
+
+The timing output reports `env_step_gpu_ms`, `cpu_copy_ms`, `replay_extend_ms`,
+`replay_sample_ms`, `fb_ms`, `critic_ms`, `aux_critic_ms`, `actor_ms`, and the
+overall agent-update time. Set `--runtime-timing-every 0` after profiling for
+the lowest possible synchronization overhead.
 
 ## TeCH Training
 
@@ -67,6 +164,27 @@ uv run python -m humanoidverse.tracking_inference \
   --save-mp4 \
   --motion-list 20
 ```
+
+For live MJLab playback of a carry trajectory (no video or ONNX export):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python -m humanoidverse.tracking_inference \
+  --model-folder runs/ufo_fb_g1_carry_box \
+  --data-manifest configs/data/lafan_g1_largebox.yaml \
+  --dataset g1_largebox \
+  --motion-list 0 \
+  --device cuda:0 \
+  --headless false \
+  --save-mp4 false \
+  --export-onnx false \
+  --disable-dr true \
+  --disable-obs-noise true
+```
+
+Use `--dataset lafan` with the same checkpoint to exercise the no-box path;
+the 19-D object observation is then exactly zero and the box is parked below
+the scene.
 
 When `--export-onnx` is enabled, `tracking_inference` exports a
 robot-config-aware policy ONNX next to the checkpoint. The policy input split is

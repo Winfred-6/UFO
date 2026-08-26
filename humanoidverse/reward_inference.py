@@ -14,6 +14,7 @@ os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
+import json
 import re
 import time
 from pathlib import Path
@@ -22,25 +23,25 @@ import joblib
 import mediapy as media
 import torch
 
+from humanoidverse.agents.buffers.torchrl_replay import TorchRLReplayBuffer
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
 from humanoidverse.agents.buffers.transition import DictBuffer
 from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
-from humanoidverse.utils.helpers import export_meta_policy_as_onnx
-from humanoidverse.mjlab_reward_relabel import RewardWrapperHV
 from humanoidverse.mjlab_inference_utils import (
     MujocoQposRenderer,
-    add_robot_config_manifest_args,
     add_bool_arg,
+    add_robot_config_manifest_args,
     checkpoint_load_device,
     load_mjlab_env_cfg,
     render_policy_frame,
     resolve_inference_data_and_robot_args,
     resolve_inference_robot_config,
-    write_mjlab_relabel_xml,
     write_g1_mjlab_relabel_xml,
+    write_mjlab_relabel_xml,
 )
+from humanoidverse.mjlab_reward_relabel import RewardWrapperHV
+from humanoidverse.utils.helpers import export_meta_policy_as_onnx
 from humanoidverse.utils.robot_spec import load_robot_training_spec
-
 
 DEFAULT_TASKS = [
     "move-ego-0-0",
@@ -174,7 +175,23 @@ def _load_replay_buffer(
             )
 
     config_path = buffer_path / "config.json"
-    if config_path.exists() and "TrajectoryDictBufferMultiDim" in config_path.read_text():
+    torchrl_config_path = buffer_path / TorchRLReplayBuffer.CONFIG_NAME
+    if torchrl_config_path.exists():
+        with torchrl_config_path.open() as file:
+            torchrl_config = json.load(file)
+        # Reward inference is read-only, so a memmap checkpoint can be mapped
+        # in place instead of recreating the original training scratch path.
+        scratch_dir = None
+        if torchrl_config.get("storage_kind") == "memmap":
+            scratch_dir = buffer_path / TorchRLReplayBuffer.STATE_DIR / "storage"
+        dataset = TorchRLReplayBuffer.load(
+            buffer_path,
+            sample_device="cpu",
+            prefetch=0,
+            pin_memory_threads=0,
+            scratch_dir=scratch_dir,
+        )
+    elif config_path.exists() and "TrajectoryDictBufferMultiDim" in config_path.read_text():
         dataset = TrajectoryDictBufferMultiDim.load(buffer_path, device="cpu")
     else:
         dataset = DictBuffer.load(buffer_path, device="cpu")

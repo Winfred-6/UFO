@@ -62,6 +62,30 @@ def _dof_vel_from_dof_pos(dof_pos, dt):
     return torch.cat([dof_vel, dof_vel[-1:]], dim=0)
 
 
+def _optional_object_state_from_motion_file(curr_file, start, end, dtype):
+    """Return synchronized object tensors, using an all-zero invalid state when absent."""
+    frame_count = int(end - start)
+    defaults = {
+        "object_pos": torch.zeros((frame_count, 3), dtype=dtype),
+        "object_quat": torch.zeros((frame_count, 4), dtype=dtype),
+        "object_lin_vel": torch.zeros((frame_count, 3), dtype=dtype),
+        "object_ang_vel": torch.zeros((frame_count, 3), dtype=dtype),
+        "object_valid": torch.zeros((frame_count, 1), dtype=dtype),
+        "object_goal_pos": torch.zeros((frame_count, 3), dtype=dtype),
+    }
+    defaults["object_quat"][:, 3] = 1.0
+    if "object_valid" not in curr_file:
+        return defaults
+    for key, default in defaults.items():
+        if key not in curr_file:
+            raise ValueError(f"Motion with object_valid is missing synchronized field {key!r}")
+        value = to_torch(curr_file[key]).clone()[start:end].to(dtype=dtype)
+        if value.shape != default.shape:
+            raise ValueError(f"{key} must have shape {tuple(default.shape)}, got {tuple(value.shape)}")
+        defaults[key] = value
+    return defaults
+
+
 class MotionLibBase():
     def __init__(self, motion_lib_cfg, num_envs, device):
         self.m_cfg = motion_lib_cfg
@@ -417,6 +441,26 @@ class MotionLibBase():
         rb_rot1 = self.grs[f1l]
         rb_rot = slerp(rb_rot0, rb_rot1, blend_exp)
         return_dict = {}
+
+        object_pos0 = self.object_pos[f0l]
+        object_pos1 = self.object_pos[f1l]
+        object_quat0 = self.object_quat[f0l]
+        object_quat1 = self.object_quat[f1l]
+        object_lin_vel0 = self.object_lin_vel[f0l]
+        object_lin_vel1 = self.object_lin_vel[f1l]
+        object_ang_vel0 = self.object_ang_vel[f0l]
+        object_ang_vel1 = self.object_ang_vel[f1l]
+        object_goal_pos0 = self.object_goal_pos[f0l]
+        object_goal_pos1 = self.object_goal_pos[f1l]
+        object_valid = self.object_valid[f0l]
+        object_pos = (1.0 - blend) * object_pos0 + blend * object_pos1
+        object_goal_pos = (1.0 - blend) * object_goal_pos0 + blend * object_goal_pos1
+        if offset is not None:
+            object_pos = object_pos + offset
+            object_goal_pos = object_goal_pos + offset
+        object_quat = slerp(object_quat0, object_quat1, blend)
+        object_lin_vel = (1.0 - blend) * object_lin_vel0 + blend * object_lin_vel1
+        object_ang_vel = (1.0 - blend) * object_ang_vel0 + blend * object_ang_vel1
         
         if "gts_t" in self.__dict__:
             rg_pos_t0 = self.gts_t[f0l]
@@ -466,6 +510,13 @@ class MotionLibBase():
             "rg_rot_t": rg_rot_t.clone(),
             "body_vel_t": body_vel_t.clone(),
             "body_ang_vel_t": body_ang_vel_t.clone(),
+            "object_pos": object_pos.clone(),
+            "object_quat": object_quat.clone(),
+            "object_lin_vel": object_lin_vel.clone(),
+            "object_ang_vel": object_ang_vel.clone(),
+            "object_valid": object_valid.clone(),
+            "object_goal_pos": object_goal_pos.clone(),
+            "motion_source_id": self._loaded_motion_source_ids[motion_ids].clone(),
         })
         return return_dict
     
@@ -515,6 +566,16 @@ class MotionLibBase():
         
         if "gts" in self.__dict__:
             del self.gts, self.grs, self.lrs, self.grvs, self.gravs, self.gavs, self.gvs, self.dvs, self.dof_pos
+            for object_field in (
+                "object_pos",
+                "object_quat",
+                "object_lin_vel",
+                "object_ang_vel",
+                "object_valid",
+                "object_goal_pos",
+            ):
+                if object_field in self.__dict__:
+                    delattr(self, object_field)
             if "gts_t" in self.__dict__:
                 del self.gts_t, self.grs_t, self.gvs_t, self.gavs_t
                 
@@ -529,6 +590,14 @@ class MotionLibBase():
         has_action = False
         _motion_actions = []
         _motion_smpl_poses = []
+        object_state_lists = {
+            "object_pos": [],
+            "object_quat": [],
+            "object_lin_vel": [],
+            "object_ang_vel": [],
+            "object_valid": [],
+            "object_goal_pos": [],
+        }
 
         total_len = 0.0
         self.num_joints = len(self.skeleton_tree.node_names)
@@ -608,6 +677,8 @@ class MotionLibBase():
                 _motion_actions.append(curr_motion.action)
             if self.smpl_data is not None:
                 _motion_smpl_poses.append(curr_motion['smpl_pose'])
+            for object_field in object_state_lists:
+                object_state_lists[object_field].append(getattr(curr_motion, object_field))
             del curr_motion
         
         self._motion_lengths = torch.tensor(_motion_lengths, device=self._device, dtype=torch.float32)
@@ -639,6 +710,9 @@ class MotionLibBase():
         
         if "dof_pos" in motions[0].__dict__:
             self.dof_pos = torch.cat([m.dof_pos for m in motions], dim=0).float().to(self._device)
+        for object_field, values in object_state_lists.items():
+            setattr(self, object_field, torch.cat(values, dim=0).float().to(self._device))
+        self._loaded_motion_source_ids = self._motion_source_ids[self._curr_motion_ids]
         
         lengths = self._motion_num_frames
         lengths_shifted = lengths.roll(1)
@@ -732,6 +806,9 @@ class MotionLibBase():
                 if raw_dof_pos is not None:
                     curr_motion.dof_pos = raw_dof_pos
                     curr_motion.dof_vels = _dof_vel_from_dof_pos(raw_dof_pos, dt)
+                object_state = _optional_object_state_from_motion_file(curr_file, start, end, pose_aa.dtype)
+                for object_field, object_value in object_state.items():
+                    setattr(curr_motion, object_field, object_value)
                 # add "action" to curr_motion
                 if self.has_action:
                     curr_motion.action = to_torch(curr_file['action']).clone()[start:end]

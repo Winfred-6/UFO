@@ -75,6 +75,11 @@ Install the environment:
 uv sync
 ```
 
+On Linux and Windows, the lockfile installs the official PyTorch 2.7.1 CUDA
+12.8 wheels. This includes `sm_120` support required by NVIDIA Blackwell GPUs
+such as the RTX 5090; an older `cu126` build that only lists architectures up
+to `sm_90` will fail before environment construction.
+
 ### Optional: W&B logging
 
 W&B logging is optional. To enable it, authenticate first, optionally set your own entity, then add `--use-wandb --wandb-run-name ...` to a training command:
@@ -128,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --buffer-size 5120000
 ```
 
-### 4. TeCH training on G1
+### 4. TeCH Training on G1
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -145,7 +150,91 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 
 TeCH was previously exposed as TLDR in early UFO versions. `--agent tldr` is kept as a deprecated compatibility alias for `--agent tech`.
 
-Core defaults live in `humanoidverse/train.py`. In particular, `--num-envs` and `--buffer-size` are per GPU, while `--num-env-steps` is the global sample budget.
+### Optional G1 carry-box task
+
+The isolated `--task carry_box` extension adds a visualized 0.5 kg rigid box
+and goal marker without changing the default `task=motion` environment. With
+no explicit data argument it mixes full LaFAN (0.70) with all 174 paired
+G1/large-box trajectories (0.30). Object state conditions the actor, F, critic,
+and auxiliary critic, while the Backward/z encoder and style discriminator
+remain robot-only. The processed carry-box PKLs and mesh are included in the
+repository, so this profile does not depend on a machine-local source folder.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+./run_train.sh \
+  --agent fb \
+  --task carry_box \
+  --gpu-ids all \
+  --num-envs 1024 \
+  --num-env-steps 192000000 \
+  --work-dir runs/ufo_fb_g1_carry_box \
+  --init-from runs/ufo_fb_g1/checkpoint \
+  --update-z-every-step 100 \
+  --buffer-size 5120000
+```
+
+`--init-from` migrates model weights only; the new optimizer, replay, and
+training counters start fresh. See [Training and Inference](docs/TRAIN_INFERENCE.md)
+for the live MJLab playback command and the full machine-specific commands.
+
+For one 32 GiB RTX 5090, use CPU replay with `--gpu-native-rollout`,
+`--buffer-prefetch 2`, and `--buffer-pin-memory-threads 2`. For eight H200s,
+the full replay can remain local to each GPU with `--buffer-storage cuda
+--buffer-prefetch 0 --buffer-pin-memory-threads 0`. Runtime breakdown sampling
+is available through `--runtime-timing-every N`; distributed Inductor/Triton
+caches are isolated per rank when `--compile` is explicitly enabled.
+
+Core defaults live in `humanoidverse/train.py`. `--num-envs` and `--buffer-size`
+are per training rank (normally one rank per GPU), while `--num-env-steps` is
+the global sample budget.
+
+### Replay-buffer memory and throughput
+
+The large online and expert replay stores default to CPU RAM. UFO uses
+[TorchRL ReplayBuffer](https://docs.pytorch.org/rl/0.8/reference/generated/torchrl.data.ReplayBuffer.html)
+and `SliceSampler` to keep trajectory boundaries intact without storing a
+duplicate copy of every next observation. Sampling, page-locking, and
+CPU-to-GPU transfer run ahead of the optimizer in background workers:
+
+```text
+CPU LazyTensorStorage -> SliceSampler -> pinned TensorDict batch -> async H2D -> GPU optimizer
+```
+
+The defaults are equivalent to:
+
+```bash
+./run_train.sh ... \
+  --buffer-storage cpu \
+  --buffer-prefetch 2 \
+  --buffer-pin-memory-threads 2
+```
+
+Storage choices:
+
+- `cpu` (default): recommended when host RAM is available. Only sampled
+  minibatches occupy VRAM.
+- `memmap`: stores the replay under
+  `<work-dir>/replay_memmap/rank_<rank>` when RAM is constrained. Fast local
+  NVMe is strongly recommended.
+- `cuda`: keeps the full replay in VRAM for small-buffer comparisons; the
+  default 5.12-million-transition G1 buffer is too large for a 32 GiB GPU.
+
+For the current G1 FB fields, 5,120,000 frames require approximately 24.7 GiB
+of host RAM per rank for the online store, plus expert data and process
+overhead. Multi-GPU jobs therefore multiply host-RAM or memmap requirements by
+the rank count. Capacity must be divisible by `--num-envs`. The smoke preset
+automatically caps replay capacity to its short rollout instead of allocating
+the full formal-training buffer.
+
+To benchmark the replay path on a machine before a long run:
+
+```bash
+uv run python scripts/benchmark_replay.py \
+  --storage all \
+  --batch-size 1024 \
+  --prefetch 2
+```
 
 ### 5. Tracking inference and ONNX export
 

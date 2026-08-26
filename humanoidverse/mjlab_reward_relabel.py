@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from torch.utils._pytree import tree_map
 
+from humanoidverse.agents.buffers.torchrl_replay import TorchRLReplayBuffer
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
 from humanoidverse.envs.g1_env_helper import rewards as g1_rewards
 from humanoidverse.envs.g1_env_helper.rewards import RewardFunction
@@ -114,6 +115,8 @@ class RewardWrapperHV(BaseMjlabRewardWrapper):
                 self.inference_dataset.output_key_tp1.append("qpos")
             if "qvel" not in self.inference_dataset.output_key_tp1:
                 self.inference_dataset.output_key_tp1.append("qvel")
+        elif isinstance(self.inference_dataset, TorchRLReplayBuffer):
+            self.inference_dataset.include_next_keys("qpos", "qvel")
 
         if self.num_samples_per_inference >= self.inference_dataset.size() and hasattr(self.inference_dataset, "get_full_buffer"):
             data = self.inference_dataset.get_full_buffer()

@@ -20,6 +20,7 @@ def build_agent_preset(
     lr_scale: float,
     clip_grad_norm: float,
     cartwheel_aux_safe: bool,
+    carry_box: bool = False,
     wandb_project: str,
 ) -> dict[str, Any]:
     if agent == "fb":
@@ -31,6 +32,7 @@ def build_agent_preset(
                 lr_scale=lr_scale,
                 clip_grad_norm=clip_grad_norm,
                 cartwheel_aux_safe=cartwheel_aux_safe,
+                carry_box=carry_box,
             ),
             "wandb_group": "ufo_fb",
             "wandb_project": wandb_project,

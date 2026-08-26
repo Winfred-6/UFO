@@ -31,6 +31,10 @@ if [[ -z "${UFO_CACHE_DIR:-}" ]]; then
   fi
 fi
 
+mkdir -p "$UFO_CACHE_DIR"
+UFO_CACHE_DIR="$(cd "$UFO_CACHE_DIR" && pwd -P)"
+export UFO_CACHE_DIR
+
 mkdir -p \
   "$UFO_CACHE_DIR/uv" \
   "$UFO_CACHE_DIR/pycache" \

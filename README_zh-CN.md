@@ -71,6 +71,11 @@ export PATH="$HOME/.local/bin:$PATH"
 uv sync
 ```
 
+在 Linux 和 Windows 上，lockfile 会安装官方 PyTorch 2.7.1 CUDA 12.8
+wheel，其中包含 RTX 5090 等 NVIDIA Blackwell GPU 所需的 `sm_120`
+支持。旧的 `cu126` 安装如果只列出到 `sm_90`，会在创建训练环境前报
+`no kernel image is available`。
+
 ### 可选：W&B logging
 
 W&B logging 是可选功能。如需启用，请先登录，按需设置自己的 entity，然后在训练命令中加入 `--use-wandb --wandb-run-name ...`：
@@ -132,6 +137,124 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ```
 
 TeCH 在早期 UFO 版本中曾经叫 TLDR。`--agent tldr` 仍然保留为 `--agent tech` 的兼容 alias，但已经不推荐继续使用。
+
+### 可选：G1 搬箱任务
+
+`--task carry_box` 是独立开关，不会改变原来的 `task=motion` 环境。未指定
+数据参数时会自动使用 `configs/data/lafan_g1_largebox.yaml`：完整 LaFAN
+权重 0.70，仓库内处理好的 174 条 G1/箱子配对轨迹权重 0.30，不再依赖
+本机 Downloads 路径。箱子是 MJLab 中的 500 g 自由刚体，并带有可视化
+目标框。
+
+箱子观测只进入 actor、F、主 critic 和 aux critic；Backward/z 编码器与
+风格 discriminator 仍只看机器人状态。旧 locomotion checkpoint 仅迁移
+模型权重，新 run 的优化器、replay 和计数器从零开始：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+./run_train.sh \
+  --agent fb \
+  --task carry_box \
+  --gpu-ids all \
+  --num-envs 1024 \
+  --num-env-steps 192000000 \
+  --work-dir runs/ufo_fb_g1_carry_box \
+  --init-from runs/ufo_fb_g1/checkpoint \
+  --update-z-every-step 100 \
+  --buffer-size 5120000
+```
+
+实时查看搬箱 tracking（不保存视频）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python -m humanoidverse.tracking_inference \
+  --model-folder runs/ufo_fb_g1_carry_box \
+  --data-manifest configs/data/lafan_g1_largebox.yaml \
+  --dataset g1_largebox \
+  --motion-list 0 \
+  --device cuda:0 \
+  --headless false \
+  --save-mp4 false \
+  --export-onnx false \
+  --disable-dr true \
+  --disable-obs-noise true
+```
+
+把 `--dataset g1_largebox` 改成 `--dataset lafan` 即可测试“不给箱子
+观测”的普通动作路径，此时 19 维箱子观测严格为全零。
+
+单张 32 GiB RTX 5090 建议保持 1024 个环境，并使用 CPU replay、后台
+预取和 GPU-native rollout：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
+```
+
+八张 H200 可以把每个 rank 的 replay 直接放在对应 GPU，去掉 CPU
+拷贝和预取线程：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
+```
+
+smoke 确认日志中出现 `rank=0/8` 到 `rank=7/8` 后，再启动正式训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
+```
+
+这里的 `--buffer-size` 是每卡容量。八卡稳定配置默认关闭分布式
+`torch.compile`；H200 smoke 通过后可加 `--compile`，每个 rank 会使用独立
+的 Inductor/Triton 临时缓存。计时确认完成后，将
+`--runtime-timing-every` 改为 `0` 可消除采样同步开销。
+每卡 512 万容量的 replay checkpoint 约为 25 GiB，八卡合计约 200 GiB；
+如果只需要全局合计 512 万容量，可改成 `--buffer-size 640000`，但每个
+rank 可看到的历史窗口也会相应缩短。
+
+### Replay buffer 的内存与吞吐
+
+在线 replay 和 expert replay 的大容量存储默认放在 CPU RAM。UFO 使用
+[TorchRL ReplayBuffer](https://docs.pytorch.org/rl/0.8/reference/generated/torchrl.data.ReplayBuffer.html)
+与 `SliceSampler` 保持轨迹边界，并且不重复保存每一帧的 next observation。
+采样、页锁定和 CPU 到 GPU 的传输会在后台提前执行：
+
+```text
+CPU LazyTensorStorage -> SliceSampler -> pinned TensorDict batch -> async H2D -> GPU optimizer
+```
+
+默认配置等价于：
+
+```bash
+./run_train.sh ... \
+  --buffer-storage cpu \
+  --buffer-prefetch 2 \
+  --buffer-pin-memory-threads 2
+```
+
+可选存储模式：
+
+- `cpu`（默认）：主机内存足够时推荐使用，显存中只保留正在训练的
+  minibatch。
+- `memmap`：主机内存紧张时写入
+  `<work-dir>/replay_memmap/rank_<rank>`；建议使用高速本地 NVMe。
+- `cuda`：用于小 buffer 对照实验。默认 512 万 transition 的 G1 buffer
+  不适合放在 32 GiB 显存中。
+
+按当前 G1 FB 字段估算，5,120,000 帧的在线 replay 每个 rank 约占
+24.7 GiB 主机内存，此外还需要 expert data 和进程运行空间。多 GPU
+训练通常是每张 GPU 一个 rank，因此 RAM 或 memmap 容量也会随 rank
+数倍增。`--buffer-size` 必须能被 `--num-envs` 整除。`--smoke` 会自动把
+buffer 容量限制到短 rollout 的规模，不再分配正式训练的完整容量。
+
+长时间训练前可以先运行 replay benchmark：
+
+```bash
+uv run python scripts/benchmark_replay.py \
+  --storage all \
+  --batch-size 1024 \
+  --prefetch 2
+```
 
 ### 6. Tracking inference
 

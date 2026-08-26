@@ -9,13 +9,14 @@ from typing import Any
 import joblib
 
 from humanoidverse.utils.motion_data.paths import expand_motion_paths
+from humanoidverse.utils.motion_data.paired_object_csv import load_paired_hhtools_csv
 from humanoidverse.utils.motion_data.robot_state_convert import robot_state_dict_to_ufo_motion_dict
 from humanoidverse.utils.motion_data.robot_state_readers import read_robot_state_csv, read_robot_state_npz
 from humanoidverse.utils.motion_data.schema import validate_ufo_motion_dict
 from humanoidverse.utils.robot_spec import RobotSpec
 
 
-SUPPORTED_FORMATS = {"ufo_pkl", "robot_state_csv", "robot_state_npz"}
+SUPPORTED_FORMATS = {"ufo_pkl", "robot_state_csv", "robot_state_npz", "robot_state_object_csv"}
 
 
 def _merge_motion_dicts(sources: list[tuple[Path, dict[str, Any]]], source_name: str) -> dict[str, Any]:
@@ -105,6 +106,14 @@ def load_motion_data_by_format(
         )
     if fmt == "robot_state_npz":
         return load_robot_state_npz(
+            path_spec,
+            source_name=source_name,
+            robot_spec=_require_robot_spec(fmt, robot_spec),
+            base_dir=base_dir,
+            fps=fps,
+        )
+    if fmt == "robot_state_object_csv":
+        return load_paired_hhtools_csv(
             path_spec,
             source_name=source_name,
             robot_spec=_require_robot_spec(fmt, robot_spec),

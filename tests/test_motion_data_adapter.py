@@ -210,7 +210,10 @@ class MotionDataAdapterTest(unittest.TestCase):
             validate_ufo_motion_dict(_motion_dict(fps=0.0), "unit")
 
     def test_public_supported_formats_are_minimal(self) -> None:
-        self.assertEqual(SUPPORTED_FORMATS, {"ufo_pkl", "robot_state_csv", "robot_state_npz"})
+        self.assertEqual(
+            SUPPORTED_FORMATS,
+            {"ufo_pkl", "robot_state_csv", "robot_state_npz", "robot_state_object_csv"},
+        )
 
     def test_robot_spec_parses_minimal_mujoco_xml(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

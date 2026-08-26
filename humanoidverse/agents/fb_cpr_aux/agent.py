@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import typing as tp
+from contextlib import nullcontext
 from typing import Dict
 
 import pydantic
@@ -82,111 +83,125 @@ class FBcprAuxAgent(FBcprAgent):
             self.update_aux_critic = CudaGraphModule(self.update_aux_critic, warmup=5)
 
     def update(self, replay_buffer, step: int) -> Dict[str, torch.Tensor]:
-        expert_batch = replay_buffer["expert_slicer"].sample(self.cfg.train.batch_size)
-        train_batch = replay_buffer["train"].sample(self.cfg.train.batch_size)
+        profiler = getattr(self, "_runtime_profiler", None)
 
-        train_obs, train_action, train_next_obs = (
-            tree_map(lambda x: x.to(self.device), train_batch["observation"]),
-            train_batch["action"].to(self.device),
-            tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
-        )
-        discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
-        expert_obs, expert_next_obs = (
-            tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
-            tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
-        )
+        def stage(name: str, *, cuda: bool = False):
+            return profiler.stage(name, cuda=cuda) if profiler is not None else nullcontext()
 
-        self._model._obs_normalizer(train_obs)
-        self._model._obs_normalizer(train_next_obs)
+        with stage("replay_sample"):
+            expert_batch = replay_buffer["expert_slicer"].sample(self.cfg.train.batch_size)
+            train_batch = replay_buffer["train"].sample(self.cfg.train.batch_size)
 
-        with torch.no_grad(), eval_mode(self._model._obs_normalizer):
-            train_obs, train_next_obs = (
-                self._model._obs_normalizer(train_obs),
-                self._model._obs_normalizer(train_next_obs),
+        with stage("update_prepare", cuda=True):
+            train_obs, train_action, train_next_obs = (
+                tree_map(lambda x: x.to(self.device), train_batch["observation"]),
+                train_batch["action"].to(self.device),
+                tree_map(lambda x: x.to(self.device), train_batch["next"]["observation"]),
             )
+            discount = self.cfg.train.discount * ~train_batch["next"]["terminated"].to(self.device)
             expert_obs, expert_next_obs = (
-                self._model._obs_normalizer(expert_obs),
-                self._model._obs_normalizer(expert_next_obs),
+                tree_map(lambda x: x.to(self.device), expert_batch["observation"]),
+                tree_map(lambda x: x.to(self.device), expert_batch["next"]["observation"]),
             )
 
-        torch.compiler.cudagraph_mark_step_begin()
-        expert_z = self.encode_expert(next_obs=expert_next_obs)
-        train_z = train_batch["z"].to(self.device)
+            self._model._obs_normalizer(train_obs)
+            self._model._obs_normalizer(train_next_obs)
+
+            with torch.no_grad(), eval_mode(self._model._obs_normalizer):
+                train_obs, train_next_obs = (
+                    self._model._obs_normalizer(train_obs),
+                    self._model._obs_normalizer(train_next_obs),
+                )
+                expert_obs, expert_next_obs = (
+                    self._model._obs_normalizer(expert_obs),
+                    self._model._obs_normalizer(expert_next_obs),
+                )
+
+            torch.compiler.cudagraph_mark_step_begin()
+            expert_z = self.encode_expert(next_obs=expert_next_obs)
+            train_z = train_batch["z"].to(self.device)
 
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
-        metrics = self.update_discriminator(
-            expert_obs=expert_obs,
-            expert_z=expert_z,
-            train_obs=train_obs,
-            train_z=train_z,
-            grad_penalty=grad_penalty,
-        )
+        with stage("discriminator", cuda=True):
+            metrics = self.update_discriminator(
+                expert_obs=expert_obs,
+                expert_z=expert_z,
+                train_obs=train_obs,
+                train_z=train_z,
+                grad_penalty=grad_penalty,
+            )
 
-        z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
-        self.z_buffer.add(z)
+        with stage("latent_prepare", cuda=True):
+            z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
+            self.z_buffer.add(z)
 
-        if self.cfg.train.relabel_ratio is not None:
-            mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
-            train_z = torch.where(mask, z, train_z)
+            if self.cfg.train.relabel_ratio is not None:
+                mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
+                train_z = torch.where(mask, z, train_z)
 
         q_loss_coef = self.cfg.train.q_loss_coef if self.cfg.train.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.train.clip_grad_norm if self.cfg.train.clip_grad_norm > 0 else None
 
-        metrics.update(
-            self.update_fb(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                goal=train_next_obs,
-                z=train_z,
-                q_loss_coef=q_loss_coef,
-                clip_grad_norm=clip_grad_norm,
+        with stage("fb", cuda=True):
+            metrics.update(
+                self.update_fb(
+                    obs=train_obs,
+                    action=train_action,
+                    discount=discount,
+                    next_obs=train_next_obs,
+                    goal=train_next_obs,
+                    z=train_z,
+                    q_loss_coef=q_loss_coef,
+                    clip_grad_norm=clip_grad_norm,
+                )
             )
-        )
-        metrics.update(
-            self.update_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                z=train_z,
+        with stage("critic", cuda=True):
+            metrics.update(
+                self.update_critic(
+                    obs=train_obs,
+                    action=train_action,
+                    discount=discount,
+                    next_obs=train_next_obs,
+                    z=train_z,
+                )
             )
-        )
         # compute scalar auxiliary reward as a weighted sum of the auxiliary rewards
-        aux_reward = torch.zeros(
-            (self.cfg.train.batch_size, 1),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        for aux_reward_name in self.cfg.aux_rewards:
-            # let's log even this information
-            metrics[f"aux_rew/{aux_reward_name}"] = train_batch["aux_rewards"][aux_reward_name].mean()
-            aux_reward += self.cfg.aux_rewards_scaling[aux_reward_name] * train_batch["aux_rewards"][aux_reward_name].to(self.device)
-
-        aux_reward = self._model._aux_reward_normalizer(aux_reward)
-
-        metrics.update(
-            self.update_aux_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                aux_reward=aux_reward,
-                next_obs=train_next_obs,
-                z=train_z,
+        with stage("aux_reward_prepare", cuda=True):
+            aux_reward = torch.zeros(
+                (self.cfg.train.batch_size, 1),
+                device=self.device,
+                dtype=torch.float32,
             )
-        )
-        metrics.update(
-            self.update_actor(
-                obs=train_obs,
-                action=train_action,
-                z=train_z,
-                clip_grad_norm=clip_grad_norm,
-            )
-        )
+            for aux_reward_name in self.cfg.aux_rewards:
+                # let's log even this information
+                metrics[f"aux_rew/{aux_reward_name}"] = train_batch["aux_rewards"][aux_reward_name].mean()
+                aux_reward += self.cfg.aux_rewards_scaling[aux_reward_name] * train_batch["aux_rewards"][aux_reward_name].to(self.device)
 
-        with torch.no_grad():
+            aux_reward = self._model._aux_reward_normalizer(aux_reward)
+
+        with stage("aux_critic", cuda=True):
+            metrics.update(
+                self.update_aux_critic(
+                    obs=train_obs,
+                    action=train_action,
+                    discount=discount,
+                    aux_reward=aux_reward,
+                    next_obs=train_next_obs,
+                    z=train_z,
+                )
+            )
+        with stage("actor", cuda=True):
+            metrics.update(
+                self.update_actor(
+                    obs=train_obs,
+                    action=train_action,
+                    z=train_z,
+                    clip_grad_norm=clip_grad_norm,
+                )
+            )
+
+        with stage("target_update", cuda=True), torch.no_grad():
             _soft_update_params(
                 self._forward_map_paramlist,
                 self._target_forward_map_paramlist,

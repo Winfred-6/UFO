@@ -45,6 +45,8 @@ class TrajectoryDictBuffer:
         output_key_tp1: List[str] = ["observation"],
         end_key: Tuple[str] | str = "done",
         motion_id_key: Tuple[str] | str = "motion_id",
+        source_ids: List[int] | None = None,
+        source_weights: List[float] | None = None,
     ) -> None:
         self._is_full = True
         self.output_key_t = output_key_t
@@ -95,8 +97,40 @@ class TrajectoryDictBuffer:
             done.squeeze()[: len(self)], at_capacity=self._is_full, cursor=None
         )
         # set priorities to match the number of trajectories
-        self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
+        if source_ids is not None:
+            if len(source_ids) != len(self.lengths):
+                raise ValueError(f"source_ids length={len(source_ids)} must match trajectories={len(self.lengths)}")
+            self.source_ids = torch.as_tensor(source_ids, device=self.device, dtype=torch.long)
+            num_sources = int(self.source_ids.max().item()) + 1 if len(source_ids) else 0
+            if source_weights is None or len(source_weights) != num_sources:
+                raise ValueError(f"source_weights must contain one value for each of {num_sources} sources")
+            self.source_weights = torch.as_tensor(source_weights, device=self.device, dtype=torch.float32)
+            if torch.any(self.source_weights < 0.0) or float(self.source_weights.sum()) <= 0.0:
+                raise ValueError("source_weights must be non-negative and sum to a positive value")
+            self.source_weights /= self.source_weights.sum()
+            self.priorities = self._normalize_source_priorities(torch.ones(len(self.lengths), device=self.device))
+        else:
+            self.source_ids = None
+            self.source_weights = None
+            self.priorities = torch.ones(len(self.lengths), device=self.device, dtype=torch.float32) / len(self.lengths)
         self._get_idxs = torch.compile(get_idxs, mode="reduce-overhead")
+
+    def _normalize_source_priorities(self, priorities: torch.Tensor) -> torch.Tensor:
+        if self.source_ids is None or self.source_weights is None:
+            return priorities / priorities.sum()
+        normalized = torch.zeros_like(priorities, dtype=torch.float32)
+        for source_id, source_weight in enumerate(self.source_weights):
+            mask = self.source_ids == source_id
+            if not bool(mask.any()) or float(source_weight) <= 0.0:
+                continue
+            values = priorities[mask].float().clamp_min(0.0)
+            if not bool(torch.isfinite(values).all()) or float(values.sum()) <= 0.0:
+                values = torch.ones_like(values)
+            normalized[mask] = values / values.sum() * source_weight
+        total = normalized.sum()
+        if not torch.isfinite(total) or float(total) <= 0.0:
+            raise ValueError("No positive source-aware trajectory priorities are available")
+        return normalized / total
 
     def sample(self, batch_size: int = 1, seq_length: int | None = None):
         seq_length = seq_length or self.seq_length
@@ -135,8 +169,9 @@ class TrajectoryDictBuffer:
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor) -> None:
         """update priorities of trajectories"""
         assert len(priorities) == len(self.priorities)
-        self.priorities[idxs] = priorities
-        self.priorities = self.priorities / torch.sum(self.priorities)
+        raw_priorities = self.priorities.clone()
+        raw_priorities[idxs] = priorities
+        self.priorities = self._normalize_source_priorities(raw_priorities)
 
     @property
     def capacity(self):

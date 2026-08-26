@@ -16,6 +16,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
     env._motion_lib.load_motions_for_training()
     episodes = []
     file_names = []
+    source_ids = []
     history_handler = HVHistoryHandler(1, env.config.obs.obs_auxiliary, env.config.obs.obs_dims, device)
     history_config = env.config.obs.obs_auxiliary["history_actor"]
     for i in range(env._motion_lib._num_unique_motions):
@@ -23,6 +24,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         motion_id = torch.tensor([i]).to(env.device).repeat(motion_times.shape[0])
         motion_res = env._motion_lib.get_motion_state(motion_id, motion_times)
         file_names.append(env._motion_lib._motion_data_keys[i])
+        source_ids.append(int(env._motion_lib._loaded_motion_source_ids[i].item()))
 
         ref_body_pos = motion_res["rg_pos_t"]
         ref_body_rots = motion_res["rg_rot_t"]
@@ -117,6 +119,8 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         episodes=episodes,
         seq_length=agent_cfg.model.seq_length,
         device=device,
+        source_ids=source_ids,
+        source_weights=env._motion_lib._motion_source_weights.detach().cpu().tolist(),
     )
 
     assert expert_buffer.storage["observation"]["state"].shape[0] == expert_buffer.storage["truncated"].shape[0]

@@ -250,6 +250,12 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
             "root_rot": motion_state["root_rot"],
             "root_vel": motion_state["root_vel"],
             "root_ang_vel": motion_state["root_ang_vel"],
+            "object_pos": motion_state["object_pos"],
+            "object_quat": motion_state["object_quat"],
+            "object_lin_vel": motion_state["object_lin_vel"],
+            "object_ang_vel": motion_state["object_ang_vel"],
+            "object_valid": motion_state["object_valid"],
+            "object_goal_pos": motion_state["object_goal_pos"],
         }
     else:
         # obs = max_local_self_obs
@@ -415,6 +421,10 @@ def _async_tracking_worker(
     tracking_joint_pos = {}
     dof_states_list = [None] * num_envs
     root_states_list = [None] * num_envs
+    object_states_list = [None] * num_envs
+    object_valid_list = [None] * num_envs
+    object_goal_list = [None] * num_envs
+    tracking_object_pos = {}
 
     # Precompute context and target states per motion
     for m_id in motion_ids:
@@ -428,6 +438,7 @@ def _async_tracking_worker(
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tree_map(lambda x: x.cpu(), tracking_target)
         tracking_joint_pos[m_id] = tracking_target_dict["dof_pos"].clone()
+        tracking_object_pos[m_id] = tracking_target_dict["object_pos"].clone()
         # import ipdb; ipdb.set_trace()
 
         ref_body_rots = tracking_target_dict["ref_body_rots"][0, 0]
@@ -447,6 +458,16 @@ def _async_tracking_worker(
             dof_init_state[..., 1] = tracking_target_dict["ref_dof_vel"][0]
             dof_states_list[env_id] = dof_init_state
             root_states_list[env_id] = ref_root_init_state
+            object_states_list[env_id] = torch.cat(
+                [
+                    tracking_target_dict["object_pos"][0],
+                    tracking_target_dict["object_quat"][0],
+                    tracking_target_dict["object_lin_vel"][0],
+                    tracking_target_dict["object_ang_vel"][0],
+                ]
+            )
+            object_valid_list[env_id] = tracking_target_dict["object_valid"][0]
+            object_goal_list[env_id] = tracking_target_dict["object_goal_pos"][0]
             # target_xpos_dict[env_id] = tracking_target_dict["ref_body_pos"][:, : len(xpos_bodies)]
 
     # this is for environments that are not initialized
@@ -455,8 +476,23 @@ def _async_tracking_worker(
             dof_states_list[i] = torch.zeros_like(core_env.simulator.dof_state.view(num_envs, -1, 2)[0])
         if root_states_list[i] is None:
             root_states_list[i] = torch.zeros_like(root_states_list[0])
+        if object_states_list[i] is None:
+            object_states_list[i] = torch.zeros(13, device=core_env.device)
+            object_states_list[i][6] = 1.0
+        if object_valid_list[i] is None:
+            object_valid_list[i] = torch.zeros(1, device=core_env.device)
+        if object_goal_list[i] is None:
+            object_goal_list[i] = torch.zeros(3, device=core_env.device)
 
     target_states = {"dof_states": torch.stack(dof_states_list), "root_states": torch.stack(root_states_list)}
+    if core_env.carry_box_enabled:
+        target_states.update(
+            {
+                "object_states": torch.stack(object_states_list),
+                "object_valid": torch.stack(object_valid_list),
+                "object_goal_pos": torch.stack(object_goal_list),
+            }
+        )
 
     env_ids = list(range(num_envs))
     env_ids = torch.tensor(env_ids, dtype=torch.long, device=core_env.device)
@@ -480,6 +516,7 @@ def _async_tracking_worker(
         xpos_log = [core_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3)]
         joint_pos = [core_env.simulator.dof_state[..., 0]]
         joint_vel = [core_env.simulator.dof_state[..., 1]]
+        object_pos_log = [core_env.object_pos.clone()] if core_env.carry_box_enabled else None
 
         max_ctx_len = max([ctx.shape[0] for ctx in ctx_dict.values()])
         for step in tqdm(range(max_ctx_len), desc="Tracking Evaluation", disable=disable_tqdm):
@@ -495,6 +532,8 @@ def _async_tracking_worker(
             joint_pos.append(core_env.simulator.dof_state[..., 0])
             joint_vel.append(core_env.simulator.dof_state[..., 1])
             xpos_log.append(core_env.simulator._rigid_body_pos.reshape(num_envs, -1, 3))
+            if object_pos_log is not None:
+                object_pos_log.append(core_env.object_pos.clone())
 
             ooo = {k: v for k, v in observation.items() if k != "history"}
             _episode.add(
@@ -527,6 +566,18 @@ def _async_tracking_worker(
                         "observation": tree_map(lambda x: x[0 : ctx_dict[m_id].shape[0] + 1, env_id], episode_data["observation"]),
                         "joint_pos": _joint_pos,
                         "target_joint_pos": _target_joint_pos,
+                        **(
+                            {
+                                "object_pos": torch.stack(object_pos_log)[
+                                    : ctx_dict[m_id].shape[0] + 1, env_id
+                                ],
+                                "target_object_pos": tracking_object_pos[m_id],
+                                "object_goal_pos": object_goal_list[env_id],
+                                "object_valid": bool(object_valid_list[env_id].item() > 0.5),
+                            }
+                            if object_pos_log is not None
+                            else {}
+                        ),
                     },
                 )
 
@@ -648,6 +699,18 @@ def _calc_metrics(ep):
     # phc metrics
     phc_metrics = compute_joint_pos_metrics(joint_pos=joint_pos, target_joint_pos=target_joint_pos)
     metr.update(phc_metrics)
+    if ep.get("object_valid", False):
+        object_pos = torch.as_tensor(ep["object_pos"], dtype=torch.float32)
+        target_object_pos = torch.as_tensor(ep["target_object_pos"], dtype=torch.float32)
+        goal_pos = torch.as_tensor(ep["object_goal_pos"], dtype=torch.float32)
+        common_length = min(object_pos.shape[0], target_object_pos.shape[0])
+        metr["box_position_error"] = torch.linalg.vector_norm(
+            object_pos[:common_length] - target_object_pos[:common_length], dim=-1
+        ).mean()
+        metr["box_final_goal_distance"] = torch.linalg.vector_norm(object_pos[-1] - goal_pos)
+        lift_height = object_pos[:, 2].max() - goal_pos[2]
+        metr["box_lift_success"] = (lift_height > 0.12).float()
+        metr["box_place_success"] = ((lift_height > 0.12) & (metr["box_final_goal_distance"] < 0.25)).float()
     for k, v in metr.items():
         if isinstance(v, torch.Tensor):
             metr[k] = v.tolist()

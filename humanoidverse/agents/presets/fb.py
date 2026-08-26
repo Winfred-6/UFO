@@ -12,7 +12,7 @@ from humanoidverse.agents.nn_models import (
     ForwardArchiConfig,
     RewardNormalizerConfig,
 )
-from humanoidverse.agents.normalizers import BatchNormNormalizerConfig, ObsNormalizerConfig
+from humanoidverse.agents.normalizers import BatchNormNormalizerConfig, IdentityNormalizerConfig, ObsNormalizerConfig
 
 
 TRAIN_RUNTIME = {
@@ -34,6 +34,7 @@ def build_fb_agent(
     lr_scale: float = 1.0,
     clip_grad_norm: float = 0.0,
     cartwheel_aux_safe: bool = False,
+    carry_box: bool = False,
 ) -> FBcprAuxAgentConfig:
     if cartwheel_aux_safe:
         aux_rewards = [
@@ -70,6 +71,34 @@ def build_fb_agent(
             "limits_torque": 0.0,
         }
 
+    if carry_box:
+        aux_rewards.extend(
+            [
+                "carry_approach",
+                "carry_approach_progress",
+                "carry_pick",
+                "carry_transport_progress",
+                "carry_success",
+                "box_overspeed_penalty",
+            ]
+        )
+        aux_rewards_scaling.update(
+            {
+                "carry_approach": 0.2,
+                "carry_approach_progress": 0.5,
+                "carry_pick": 1.0,
+                "carry_transport_progress": 2.0,
+                "carry_success": 5.0,
+                "box_overspeed_penalty": -0.05,
+            }
+        )
+
+    forward_keys = ["state", "privileged_state", "last_action", "history_actor"]
+    actor_keys = ["state", "last_action", "history_actor"]
+    if carry_box:
+        forward_keys.append("object_obs")
+        actor_keys.append("object_obs")
+
     return FBcprAuxAgentConfig(
         name="FBcprAuxAgent",
         model=FBcprAuxModelConfig(
@@ -88,7 +117,7 @@ def build_fb_agent(
                     num_parallel=2,
                     ensemble_mode="batch",
                     input_filter=DictInputFilterConfig(
-                        name="DictInputFilterConfig", key=["state", "privileged_state", "last_action", "history_actor"]
+                        name="DictInputFilterConfig", key=forward_keys
                     ),
                 ),
                 b=BackwardArchiConfig(
@@ -104,7 +133,7 @@ def build_fb_agent(
                     hidden_dim=2048,
                     hidden_layers=6,
                     embedding_layers=2,
-                    input_filter=DictInputFilterConfig(name="DictInputFilterConfig", key=["state", "last_action", "history_actor"]),
+                    input_filter=DictInputFilterConfig(name="DictInputFilterConfig", key=actor_keys),
                 ),
                 critic=ForwardArchiConfig(
                     name="ForwardArchi",
@@ -115,7 +144,7 @@ def build_fb_agent(
                     num_parallel=2,
                     ensemble_mode="batch",
                     input_filter=DictInputFilterConfig(
-                        name="DictInputFilterConfig", key=["state", "privileged_state", "last_action", "history_actor"]
+                        name="DictInputFilterConfig", key=forward_keys
                     ),
                 ),
                 discriminator=DiscriminatorArchiConfig(
@@ -133,7 +162,7 @@ def build_fb_agent(
                     num_parallel=2,
                     ensemble_mode="batch",
                     input_filter=DictInputFilterConfig(
-                        name="DictInputFilterConfig", key=["state", "privileged_state", "last_action", "history_actor"]
+                        name="DictInputFilterConfig", key=forward_keys
                     ),
                 ),
             ),
@@ -144,6 +173,11 @@ def build_fb_agent(
                     "privileged_state": BatchNormNormalizerConfig(name="BatchNormNormalizerConfig", momentum=0.01),
                     "last_action": BatchNormNormalizerConfig(name="BatchNormNormalizerConfig", momentum=0.01),
                     "history_actor": BatchNormNormalizerConfig(name="BatchNormNormalizerConfig", momentum=0.01),
+                    **(
+                        {"object_obs": IdentityNormalizerConfig(name="IdentityNormalizerConfig")}
+                        if carry_box
+                        else {}
+                    ),
                 },
                 allow_mismatching_keys=True,
             ),

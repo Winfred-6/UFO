@@ -363,6 +363,10 @@ def load_mjlab_env_cfg(
 
     if data_path is not None:
         env_config["lafan_tail_path"] = str(data_path.expanduser().resolve())
+        # A CLI inference override selects exactly one source. Keeping the
+        # training-time weights from a mixed manifest would make MotionLib see
+        # two weights for one path.
+        env_config["data_mix_weights"] = None
     elif DEFAULT_INFERENCE_DATA_PATH.exists():
         env_config["lafan_tail_path"] = str(DEFAULT_INFERENCE_DATA_PATH)
     else:

@@ -217,7 +217,13 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
             "ref_body_pos": ref_body_pos,
             "ref_body_rots": ref_body_rots,
             "ref_body_vels": ref_body_vels,
-            "ref_body_angular_vels": ref_body_angular_vels
+            "ref_body_angular_vels": ref_body_angular_vels,
+            "object_pos": motion_state["object_pos"],
+            "object_quat": motion_state["object_quat"],
+            "object_lin_vel": motion_state["object_lin_vel"],
+            "object_ang_vel": motion_state["object_ang_vel"],
+            "object_valid": motion_state["object_valid"],
+            "object_goal_pos": motion_state["object_goal_pos"],
         }
         state = torch.cat([ref_dof_pos,
                     ref_dof_vel,
@@ -238,7 +244,7 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
         return max_local_self_obs, ref_dict
 
 
-_SUPPORTED_POLICY_ACTOR_INPUT_KEYS = ("state", "last_action", "history_actor")
+_SUPPORTED_POLICY_ACTOR_INPUT_KEYS = ("state", "last_action", "history_actor", "object_obs")
 
 
 def _as_actor_input_keys(raw_keys: Any) -> list[str]:

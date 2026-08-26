@@ -1,4 +1,4 @@
-"""Tracking inference and video export for UFO policies.
+"""Tracking inference, live MJLab playback, and video export for UFO policies.
 
 Policy rollout is rendered from the training environment, while the reference
 motion is rendered from the configured robot MJCF with pure MuJoCo qpos playback.
@@ -35,6 +35,61 @@ from humanoidverse.utils.robot_spec import assert_robot_configs_compatible, load
 
 
 DEFAULT_ROBOT_CONFIG = "configs/robots/g1_29dof.yaml"
+
+
+class _TrackingViewerEnv:
+    """Expose UFO observations and stepping through MJLab's native viewer API."""
+
+    def __init__(self, wrapped_env: Any, target_states: dict[str, torch.Tensor]) -> None:
+        self._wrapped_env = wrapped_env
+        self._target_states = target_states
+        self.num_envs = wrapped_env.num_envs
+
+    @property
+    def device(self) -> str:
+        return str(self._wrapped_env.device)
+
+    @property
+    def cfg(self) -> Any:
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self) -> Any:
+        return self._wrapped_env.base_env.mjlab_env
+
+    def get_observations(self) -> Any:
+        return self._wrapped_env.base_env.get_observation(
+            to_numpy=False,
+            include_last_action=self._wrapped_env.include_last_action,
+            include_history_actor=self._wrapped_env.include_history_actor,
+        )
+
+    def step(self, actions: torch.Tensor) -> Any:
+        return self._wrapped_env.step(actions, to_numpy=False)
+
+    def reset(self) -> Any:
+        return self._wrapped_env.reset(to_numpy=False, target_states=self._target_states)
+
+    def close(self) -> None:
+        self._wrapped_env.close()
+
+
+class _TrackingViewerPolicy:
+    """Advance through the motion-conditioned latent sequence one control step at a time."""
+
+    def __init__(self, model: torch.nn.Module, z: torch.Tensor) -> None:
+        self._model = model
+        self._z = z
+        self._step = 0
+
+    def __call__(self, observation: Any) -> torch.Tensor:
+        z_index = min(self._step, self._z.shape[0] - 1)
+        action = self._model.act(observation, self._z[z_index].unsqueeze(0), mean=True)
+        self._step += 1
+        return action
+
+    def reset(self) -> None:
+        self._step = 0
 
 
 def _resize_nearest(frame: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -87,7 +142,25 @@ def _target_states_from_obs(obs_dict: dict[str, torch.Tensor], device: str, *, n
     dof_state = torch.zeros((int(num_dof), 2), device=device, dtype=torch.float32)
     dof_state[:, 0] = obs_dict["dof_pos"][0].to(device=device, dtype=torch.float32)
     dof_state[:, 1] = obs_dict["ref_dof_vel"][0].to(device=device, dtype=torch.float32)
-    return {"root_states": root_state_xyzw.unsqueeze(0), "dof_states": dof_state.unsqueeze(0)}
+    target_states = {"root_states": root_state_xyzw.unsqueeze(0), "dof_states": dof_state.unsqueeze(0)}
+    if "object_pos" in obs_dict:
+        object_state = torch.cat(
+            [
+                obs_dict["object_pos"][0],
+                obs_dict["object_quat"][0],
+                obs_dict["object_lin_vel"][0],
+                obs_dict["object_ang_vel"][0],
+            ],
+            dim=-1,
+        ).to(device=device, dtype=torch.float32)
+        target_states.update(
+            {
+                "object_states": object_state.unsqueeze(0),
+                "object_valid": obs_dict["object_valid"][0:1].to(device=device, dtype=torch.float32),
+                "object_goal_pos": obs_dict["object_goal_pos"][0:1].to(device=device, dtype=torch.float32),
+            }
+        )
+    return target_states
 
 
 @torch.no_grad()
@@ -245,6 +318,16 @@ def run_tracking_inference(
             episode_len = int(z.shape[0])
             if max_steps is not None:
                 episode_len = min(episode_len, int(max_steps))
+
+            if not headless and not save_mp4:
+                from mjlab.viewer import NativeMujocoViewer
+
+                print(f"[INFO] Opening MJLab native viewer for motion_id={motion_id}, steps={episode_len}", flush=True)
+                viewer_env = _TrackingViewerEnv(wrapped_env, target_states)
+                viewer_policy = _TrackingViewerPolicy(model, z)
+                NativeMujocoViewer(viewer_env, viewer_policy, frame_rate=float(fps)).run(num_steps=episode_len)
+                continue
+
             expert_qpos = _expert_qpos_from_obs(
                 obs_dict,
                 num_dof=num_dof,
@@ -295,7 +378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-manifest", type=Path, default=None, help="Motion data manifest. Use with --dataset.")
     parser.add_argument("--dataset", default=None, help="Dataset name inside --data-manifest for tracking inference.")
     parser.add_argument("--rebuild-motion-cache", action="store_true", help="Rebuild manifest-generated motion pkl cache.")
-    add_bool_arg(parser, "--headless", True, "Run MuJoCo in headless mode.")
+    add_bool_arg(parser, "--headless", True, "Run headless; false opens MJLab's native MuJoCo viewer when MP4 export is off.")
     parser.add_argument("--device", default="cuda:0")
     add_bool_arg(parser, "--save-mp4", False, "Save side-by-side expert/policy MP4.")
     add_bool_arg(parser, "--disable-dr", False, "Disable domain randomization.")

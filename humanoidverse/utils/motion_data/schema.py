@@ -10,6 +10,14 @@ import numpy as np
 
 
 REQUIRED_MOTION_FIELDS = ("root_trans_offset", "pose_aa", "fps")
+OBJECT_TIME_SERIES_FIELDS = {
+    "object_pos": 3,
+    "object_quat": 4,
+    "object_lin_vel": 3,
+    "object_ang_vel": 3,
+    "object_valid": 1,
+    "object_goal_pos": 3,
+}
 
 
 def _fail(source_name: str, motion_key: str | None, message: str) -> None:
@@ -69,6 +77,31 @@ def validate_ufo_motion_dict(data: dict[str, dict[str, Any]] | Mapping[str, Mapp
                 motion_key,
                 f"root_trans_offset and pose_aa must share T, got {root_trans_offset.shape[0]} and {pose_aa.shape[0]}",
             )
+
+        present_object_fields = [field for field in OBJECT_TIME_SERIES_FIELDS if field in motion]
+        if present_object_fields and set(present_object_fields) != set(OBJECT_TIME_SERIES_FIELDS):
+            missing = sorted(set(OBJECT_TIME_SERIES_FIELDS) - set(present_object_fields))
+            _fail(source_name, motion_key, f"partial object trajectory is missing fields {missing}")
+        for field, width in OBJECT_TIME_SERIES_FIELDS.items():
+            if field not in motion:
+                continue
+            value = np.asarray(motion[field])
+            if value.shape != (root_trans_offset.shape[0], width):
+                _fail(
+                    source_name,
+                    motion_key,
+                    f"{field} must have shape [T, {width}], got {value.shape}",
+                )
+            if not np.all(np.isfinite(value)):
+                _fail(source_name, motion_key, f"{field} contains non-finite values")
+        if "object_quat" in motion:
+            quat_norm = np.linalg.norm(np.asarray(motion["object_quat"]), axis=1)
+            if np.any(np.abs(quat_norm - 1.0) > 1.0e-3):
+                _fail(source_name, motion_key, "object_quat must contain normalized xyzw quaternions")
+        if "object_valid" in motion:
+            valid = np.asarray(motion["object_valid"])
+            if np.any((valid < 0.0) | (valid > 1.0)):
+                _fail(source_name, motion_key, "object_valid values must be in [0, 1]")
 
         validated[motion_key] = motion
 

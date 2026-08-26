@@ -3,47 +3,52 @@
 # This source code is licensed under the CC BY-NC 4.0 license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-
-from humanoidverse.agents.evaluations.humanoidverse_mjlab import (
-    HumanoidVerseMjlabTrackingEvaluation,
-    HumanoidVerseMjlabTrackingEvaluationConfig,
-)
-from humanoidverse.agents.envs.expert_motion_loader import load_expert_trajectories_from_motion_lib
-from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
-
-os.environ["OMP_NUM_THREADS"] = "1"
-
-import torch
-
-torch.set_float32_matmul_precision("high")
-
 import json
+import os
 import time
 import typing as tp
-import warnings
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List
-from torch.utils._pytree import tree_map
+
+os.environ["OMP_NUM_THREADS"] = "1"
 
 import gymnasium
 import numpy as np
 import pydantic
+import safetensors.torch
 import torch  # better to use scoped import if we use processes
 import wandb
 from packaging.version import Version
+from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
+torch.set_float32_matmul_precision("high")
 
 from humanoidverse.agents.base import BaseConfig
+from humanoidverse.agents.buffers.torchrl_replay import PrefetchedDeviceBuffer, TorchRLReplayBuffer
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
 from humanoidverse.agents.buffers.transition import DictBuffer, dtype_numpytotorch_lower_precision
+from humanoidverse.agents.envs.expert_motion_loader import load_expert_trajectories_from_motion_lib
+from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
+from humanoidverse.agents.evaluations.humanoidverse_mjlab import (
+    HumanoidVerseMjlabTrackingEvaluation,
+    HumanoidVerseMjlabTrackingEvaluationConfig,
+)
 from humanoidverse.agents.fb_cpr.agent import FBcprAgentConfig
 from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig
 from humanoidverse.agents.misc.loggers import CSVLogger
 from humanoidverse.agents.tldr_dist_aux.agent import TldrDistAuxAgentConfig
 from humanoidverse.agents.utils import EveryNStepsChecker, get_local_workdir, set_seed_everywhere
-from humanoidverse.distributed import average_metrics, barrier, broadcast_agent_state, broadcast_object, module_sync_report, sync_floating_buffers
+from humanoidverse.distributed import (
+    average_metrics,
+    barrier,
+    broadcast_agent_state,
+    broadcast_object,
+    module_sync_report,
+    sync_floating_buffers,
+)
 
 TRAIN_LOG_FILENAME = "train_log.txt"
 REWARD_EVAL_LOG_FILENAME = "reward_eval_log.csv"
@@ -104,6 +109,7 @@ class TrainConfig(BaseConfig):
     env: HumanoidVerseMjlabConfig = pydantic.Field(discriminator="name")
 
     work_dir: str = pydantic.Field(default_factory=lambda: get_local_workdir("g1mujoco_train"))
+    init_from: str | None = None
 
     seed: int = 0
     online_parallel_envs: int = 50
@@ -129,6 +135,13 @@ class TrainConfig(BaseConfig):
     # Buffer
     use_trajectory_buffer: bool = False
     buffer_size: int = 5_000_000
+    buffer_storage: str = "cpu"
+    buffer_sample_device: str = "cpu"
+    buffer_prefetch: int = 2
+    buffer_pin_memory_threads: int = 2
+    buffer_scratch_dir: str | None = None
+    gpu_native_rollout: bool = True
+    runtime_timing_every: int = 0
 
     # WANDB
     use_wandb: bool = False
@@ -200,6 +213,206 @@ class TrainConfig(BaseConfig):
         return Workspace(self)
 
 
+class _RuntimeBreakdownProfiler:
+    """Low-overhead sampled wall/CUDA timing for one rollout iteration.
+
+    CUDA events are resolved once after the profiled iteration, avoiding a
+    device synchronization around every individual training stage.
+    """
+
+    def __init__(self, *, device: str, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self.device = torch.device(device)
+        self._wall_totals: dict[str, float] = defaultdict(float)
+        self._wall_counts: dict[str, int] = defaultdict(int)
+        self._cuda_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
+
+    @contextmanager
+    def stage(self, name: str, *, cuda: bool = False):
+        if not self.enabled:
+            yield
+            return
+        use_cuda_events = cuda and self.device.type == "cuda" and torch.cuda.is_available()
+        if use_cuda_events:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                yield
+            finally:
+                end.record()
+                self._cuda_events[name].append((start, end))
+            return
+
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._wall_totals[name] += (time.perf_counter() - start_time) * 1000.0
+            self._wall_counts[name] += 1
+
+    def collect(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        if self._cuda_events:
+            # One synchronization resolves all event pairs from this sampled
+            # rollout/update group. Profiling is opt-in and normally sparse.
+            torch.cuda.synchronize(self.device)
+        result = {
+            f"timing/{name}_ms": total / max(self._wall_counts[name], 1)
+            for name, total in self._wall_totals.items()
+        }
+        for name, pairs in self._cuda_events.items():
+            result[f"timing/{name}_ms"] = sum(start.elapsed_time(end) for start, end in pairs) / max(len(pairs), 1)
+        return result
+
+
+def _to_agent_tensor(value: tp.Any, *, device: str) -> tp.Any:
+    if isinstance(value, torch.Tensor):
+        dtype = dtype_numpytotorch_lower_precision(value.dtype)
+        return value.to(device=device, dtype=dtype)
+    if isinstance(value, np.ndarray):
+        dtype = dtype_numpytotorch_lower_precision(value.dtype)
+        return torch.as_tensor(value, dtype=dtype, device=device)
+    return value
+
+
+def _to_cpu_replay_value(value: tp.Any) -> tp.Any:
+    """Detach a rollout value and keep replay tensors in CPU-friendly dtypes."""
+    if isinstance(value, torch.Tensor):
+        dtype = torch.float32 if value.dtype == torch.float64 else value.dtype
+        return value.detach().to(device="cpu", dtype=dtype)
+    if isinstance(value, np.ndarray) and value.dtype == np.float64:
+        return value.astype(np.float32, copy=False)
+    return value
+
+
+def _index_replay_value(value: tp.Any, indexes: tp.Any) -> tp.Any:
+    if isinstance(value, torch.Tensor):
+        dtype = torch.float32 if value.dtype == torch.float64 else value.dtype
+        return value.to(dtype=dtype)[indexes]
+    if isinstance(value, np.ndarray):
+        dtype = np.float32 if value.dtype == np.float64 else value.dtype
+        return value.astype(dtype, copy=False)[indexes]
+    return value
+
+
+def _resolve_init_model_path(init_from: str | Path) -> Path:
+    source = Path(init_from).expanduser().resolve()
+    candidates = (
+        source / "model" / "model.safetensors",
+        source / "checkpoint" / "model" / "model.safetensors",
+        source / "model.safetensors",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find model.safetensors below --init-from={source}")
+
+
+def _copy_with_inserted_features(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    *,
+    insert_count: int,
+    tail_count: int,
+    zero_insert: bool,
+) -> torch.Tensor | None:
+    differing_axes = [
+        axis
+        for axis, (source_size, destination_size) in enumerate(zip(source.shape, destination.shape))
+        if destination_size == source_size + insert_count
+    ]
+    if len(source.shape) != len(destination.shape) or len(differing_axes) != 1:
+        return None
+    axis = differing_axes[0]
+    if any(
+        source.shape[other_axis] != destination.shape[other_axis]
+        for other_axis in range(source.ndim)
+        if other_axis != axis
+    ):
+        return None
+    old_width = source.shape[axis]
+    if tail_count < 0 or tail_count > old_width:
+        return None
+    insert_at = old_width - tail_count
+    result = destination.clone()
+    prefix = [slice(None)] * source.ndim
+    prefix[axis] = slice(0, insert_at)
+    result[tuple(prefix)] = source[tuple(prefix)]
+    if zero_insert:
+        inserted = [slice(None)] * source.ndim
+        inserted[axis] = slice(insert_at, insert_at + insert_count)
+        result[tuple(inserted)] = 0.0
+    if tail_count:
+        source_tail = [slice(None)] * source.ndim
+        source_tail[axis] = slice(insert_at, old_width)
+        destination_tail = [slice(None)] * source.ndim
+        destination_tail[axis] = slice(insert_at + insert_count, old_width + insert_count)
+        result[tuple(destination_tail)] = source[tuple(source_tail)]
+    return result
+
+
+def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
+    """Load a locomotion checkpoint while zero-expanding new object input columns."""
+    model_path = _resolve_init_model_path(init_from)
+    source_state = safetensors.torch.load_file(model_path, device="cpu")
+    destination_state = agent._model.state_dict()
+    object_space = getattr(agent.obs_space, "spaces", {}).get("object_obs")
+    object_dim = int(object_space.shape[0]) if object_space is not None else 0
+    if object_dim <= 0:
+        raise ValueError("--init-from weight migration is intended for a model with object_obs")
+
+    migrated: dict[str, torch.Tensor] = {}
+    exact_count = 0
+    expanded_count = 0
+    incompatible: list[str] = []
+    for key, destination in destination_state.items():
+        source = source_state.get(key)
+        if source is None:
+            continue
+        source = source.to(device=destination.device, dtype=destination.dtype)
+        if source.shape == destination.shape:
+            migrated[key] = source
+            exact_count += 1
+            continue
+
+        if ".embed_z.0.mlp." in key:
+            tail_count = int(agent.cfg.model.archi.z_dim)
+        elif ".embed_sa.0.mlp." in key:
+            tail_count = int(agent.action_dim)
+        elif ".embed_s.0.mlp." in key:
+            tail_count = 0
+        else:
+            incompatible.append(key)
+            continue
+        expanded = _copy_with_inserted_features(
+            source,
+            destination,
+            insert_count=object_dim,
+            tail_count=tail_count,
+            zero_insert=key.endswith("mlp.1.weight"),
+        )
+        if expanded is None:
+            incompatible.append(key)
+            continue
+        migrated[key] = expanded
+        expanded_count += 1
+
+    if incompatible:
+        preview = ", ".join(incompatible[:8])
+        raise ValueError(f"Cannot migrate incompatible checkpoint tensors ({len(incompatible)}): {preview}")
+    missing, unexpected = agent._model.load_state_dict(migrated, strict=False)
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys while loading --init-from checkpoint: {unexpected}")
+    print(
+        "[INFO] Initialized model weights only: "
+        f"source={model_path}, exact_tensors={exact_count}, expanded_object_input_tensors={expanded_count}, "
+        f"new_tensors={len(missing)}; optimizer/replay/train counters were not loaded",
+        flush=True,
+    )
+
+
 def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_build_kwargs: dict[str, tp.Any]):
     checkpoint_dir = work_dir / CHECKPOINT_DIR_NAME
     train_status_path = checkpoint_dir / "train_status.json"
@@ -216,6 +429,8 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
         agent = cfg.agent.object_class.load(checkpoint_dir, device=cfg.agent.model.device)
     else:
         agent = cfg.agent.build(**agent_build_kwargs)
+        if cfg.init_from is not None:
+            _initialize_agent_weights_only(agent, cfg.init_from)
     return agent, cfg, checkpoint_status
 
 
@@ -557,6 +772,16 @@ class Workspace:
         if self.training_with_expert_data:
             if self.cfg.load_expert_data_from_motion_lib:
                 expert_buffer = load_expert_trajectories_from_motion_lib(self.train_env._env, self.cfg.agent, device=self.cfg.buffer_device)
+                expert_buffer = PrefetchedDeviceBuffer(
+                    expert_buffer,
+                    batch_size=self.cfg.agent.train.batch_size,
+                    sample_device=self.cfg.buffer_sample_device,
+                    # The legacy expert sampler compiles its CUDA indexer with
+                    # cudagraphs, which must be invoked on the training thread.
+                    # CPU sampling is safe to overlap in background workers.
+                    prefetch=self.cfg.buffer_prefetch if self.cfg.buffer_device == "cpu" else 0,
+                    pin_memory_threads=self.cfg.buffer_pin_memory_threads,
+                )
             else:
                 raise RuntimeError(
                     "This MJLab-focused build only supports expert data loaded from the motion library. "
@@ -569,6 +794,16 @@ class Workspace:
             train_env_info = self.train_env_info
         else:
             train_env, train_env_info = self.cfg.env.build(num_envs=self.cfg.online_parallel_envs)
+        gpu_native_rollout = bool(
+            self.cfg.gpu_native_rollout
+            and isinstance(self.cfg.env, HumanoidVerseMjlabConfig)
+            and str(self.agent.device).startswith("cuda")
+        )
+        native_action_low = None
+        native_action_high = None
+        if gpu_native_rollout:
+            native_action_low = torch.as_tensor(train_env.action_space.low, device=self.agent.device, dtype=torch.float32)
+            native_action_high = torch.as_tensor(train_env.action_space.high, device=self.agent.device, dtype=torch.float32)
 
         print("Allocating buffers")
         replay_buffer = {}
@@ -576,23 +811,34 @@ class Workspace:
         checkpoint_buffer_dir = self._checkpoint_buffer_path(checkpoint_dir)
         if checkpoint_buffer_dir.exists():
             print("Loading checkpointed buffer")
-            if self.cfg.use_trajectory_buffer:
+            if (checkpoint_buffer_dir / TorchRLReplayBuffer.CONFIG_NAME).exists():
+                replay_buffer["train"] = TorchRLReplayBuffer.load(
+                    checkpoint_buffer_dir,
+                    sample_device=self.cfg.buffer_sample_device,
+                    prefetch=self.cfg.buffer_prefetch,
+                    pin_memory_threads=self.cfg.buffer_pin_memory_threads,
+                    scratch_dir=self.cfg.buffer_scratch_dir if self.cfg.buffer_storage == "memmap" else None,
+                )
+            elif self.cfg.use_trajectory_buffer:
                 replay_buffer["train"] = TrajectoryDictBufferMultiDim.load(checkpoint_buffer_dir, device=self.cfg.buffer_device)
             else:
                 replay_buffer["train"] = DictBuffer.load(checkpoint_buffer_dir, device=self.cfg.buffer_device)
             print(f"Loaded buffer of size {len(replay_buffer['train'])}")
         else:
-            if self.cfg.use_trajectory_buffer:
-                replay_buffer["train"] = TrajectoryDictBufferMultiDim(
-                    capacity=self.cfg.buffer_size // self.cfg.online_parallel_envs,  # make sure to divide by num_envs
-                    device=self.cfg.buffer_device,
-                    n_dim=2,
-                    end_key="truncated",
-                    output_key_t=_trajectory_output_keys(self.cfg.agent),
-                    output_key_tp1=["observation", "terminated"],
-                )
-            else:
-                replay_buffer["train"] = DictBuffer(capacity=self.cfg.buffer_size, device=self.cfg.buffer_device)
+            replay_buffer["train"] = TorchRLReplayBuffer(
+                capacity=self.cfg.buffer_size,
+                batch_size=self.cfg.agent.train.batch_size,
+                sample_device=self.cfg.buffer_sample_device,
+                storage_kind=self.cfg.buffer_storage,
+                prefetch=self.cfg.buffer_prefetch,
+                pin_memory_threads=self.cfg.buffer_pin_memory_threads,
+                trajectory=self.cfg.use_trajectory_buffer,
+                num_envs=self.cfg.online_parallel_envs,
+                end_key="truncated",
+                output_key_t=_trajectory_output_keys(self.cfg.agent),
+                output_key_tp1=["observation", "terminated"],
+                scratch_dir=self.cfg.buffer_scratch_dir if self.cfg.buffer_storage == "memmap" else None,
+            )
         if self.training_with_expert_data:
             replay_buffer["expert_slicer"] = expert_buffer
 
@@ -612,6 +858,7 @@ class Workspace:
                 f"replay_capacity_per_rank={_replay_capacity_per_rank(self.cfg)}, "
                 f"effective_replay_capacity={_effective_replay_capacity(self.cfg)}, "
                 f"trajectory_steps_per_rank={_trajectory_steps_per_rank(self.cfg)}, "
+                f"gpu_native_rollout={gpu_native_rollout}, runtime_timing_every={self.cfg.runtime_timing_every}, "
                 f"compile={self.cfg.agent.compile}"
             )
         progb = tqdm(
@@ -619,7 +866,7 @@ class Workspace:
             initial=min(self._checkpoint_global_time, self.cfg.num_env_steps),
             disable=self.cfg.disable_tqdm,
         )
-        td, info = train_env.reset()
+        td, info = train_env.reset(to_numpy=False) if gpu_native_rollout else train_env.reset()
         if self.cfg.fail_on_nonfinite:
             _assert_finite(
                 td,
@@ -630,11 +877,18 @@ class Workspace:
                 optimizer_steps=self._optimizer_steps,
             )
         # see https://farama.org/Vector-Autoreset-Mode
-        terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-        truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-        done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+        if gpu_native_rollout:
+            terminated = torch.zeros(self.cfg.online_parallel_envs, dtype=torch.bool, device=self.agent.device)
+            truncated = torch.zeros_like(terminated)
+            done = torch.zeros_like(terminated)
+        else:
+            terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+            truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+            done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
         total_metrics, context = None, None
         metric_update_counts: dict[str, int] = {}
+        runtime_timing_totals: dict[str, float] = defaultdict(float)
+        runtime_timing_counts: dict[str, int] = defaultdict(int)
         start_time = time.time()
         fps_start_time = time.time()
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.checkpoint_every_steps)
@@ -671,7 +925,7 @@ class Workspace:
                 eval_time_checker.update_last_step(global_time)
                 if uses_humanoidverse_eval:
                     # reset if there is a humanoidverse evaluation
-                    td, info = train_env.reset()
+                    td, info = train_env.reset(to_numpy=False) if gpu_native_rollout else train_env.reset()
                     if self.cfg.fail_on_nonfinite:
                         _assert_finite(
                             td,
@@ -681,9 +935,14 @@ class Workspace:
                             global_time=global_time,
                             optimizer_steps=self._optimizer_steps,
                         )
-                    terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-                    truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
-                    done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+                    if gpu_native_rollout:
+                        terminated = torch.zeros(self.cfg.online_parallel_envs, dtype=torch.bool, device=self.agent.device)
+                        truncated = torch.zeros_like(terminated)
+                        done = torch.zeros_like(terminated)
+                    else:
+                        terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+                        truncated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
+                        done = np.zeros(self.cfg.online_parallel_envs, dtype=bool)
 
                 if self.cfg.prioritization:
                     # priorities
@@ -754,10 +1013,30 @@ class Workspace:
                     )
                 break
 
-            with torch.no_grad():
-                obs = tree_map(lambda x: torch.tensor(x, dtype=dtype_numpytotorch_lower_precision(x.dtype), device=self.agent.device), td)
+            post_seed_iteration = max(local_time - self.cfg.num_seed_steps, 0) // max(local_step_increment, 1)
+            profile_this_iteration = (
+                self.cfg.runtime_timing_every > 0
+                and local_time >= self.cfg.num_seed_steps
+                and post_seed_iteration % self.cfg.runtime_timing_every == 0
+            )
+            profiler = _RuntimeBreakdownProfiler(device=self.agent.device, enabled=profile_this_iteration)
+
+            with torch.no_grad(), profiler.stage("rollout_total_gpu", cuda=True):
+                obs = tree_map(lambda x: _to_agent_tensor(x, device=self.agent.device), td)
                 # TODO consistency with obs_space: remove time assigned by TimeAwareObservationWrapper
                 step_count = obs.pop("time")
+                if gpu_native_rollout:
+                    replay_obs = tree_map(lambda x: x, obs)
+                    replay_step_count = step_count
+                elif self.cfg.buffer_device == "cpu":
+                    replay_obs = tree_map(
+                        lambda x: x.astype(np.float32, copy=False) if isinstance(x, np.ndarray) and x.dtype == np.float64 else x,
+                        td,
+                    )
+                    replay_step_count = replay_obs.pop("time")
+                else:
+                    replay_obs = obs
+                    replay_step_count = step_count
 
                 history_context = None
                 if "history" in obs:
@@ -769,17 +1048,21 @@ class Workspace:
                             :, -1
                         ].clone()
 
-                context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
+                with profiler.stage("rollout_context", cuda=True):
+                    context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
                 if local_time < self.cfg.num_seed_steps:
-                    action = train_env.action_space.sample().astype(np.float32)
+                    if gpu_native_rollout:
+                        action = native_action_low + torch.rand_like(native_action_low) * (native_action_high - native_action_low)
+                    else:
+                        action = train_env.action_space.sample().astype(np.float32)
                 else:
                     # this works in inference mode
-                    if history_context is not None:
-                        action = self.agent.act(obs=obs, z=context, context=history_context, mean=False)
-                    else:
-                        action = self.agent.act(obs=obs, z=context, mean=False)
-                    # TODO a bit hard-coded -- just to avoid moving stuff from cpu to cuda
-                    if isinstance(self.cfg.env, HumanoidVerseMjlabConfig):
+                    with profiler.stage("policy", cuda=True):
+                        if history_context is not None:
+                            action = self.agent.act(obs=obs, z=context, context=history_context, mean=False)
+                        else:
+                            action = self.agent.act(obs=obs, z=context, mean=False)
+                    if isinstance(self.cfg.env, HumanoidVerseMjlabConfig) and not gpu_native_rollout:
                         action = action.cpu().detach().numpy()
                 check_rollout_nonfinite = (
                     self.cfg.fail_on_nonfinite
@@ -819,7 +1102,11 @@ class Workspace:
                         global_time=global_time,
                         optimizer_steps=self._optimizer_steps,
                     )
-            new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
+            with profiler.stage("env_step_host"), profiler.stage("env_step_gpu", cuda=True):
+                if gpu_native_rollout:
+                    new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action, to_numpy=False)
+                else:
+                    new_td, new_reward, new_terminated, new_truncated, new_info = train_env.step(action)
             if check_rollout_nonfinite:
                 _assert_finite(
                     new_td,
@@ -847,17 +1134,21 @@ class Workspace:
                 if isinstance(self.cfg.env, HumanoidVerseMjlabConfig) and uses_humanoidverse_eval:
                     # make sure we set truncated since at the next iteration we are forced to reset the environment
                     # after the evaluation. This is because we share the environment with the evaluation
-                    new_truncated = np.ones_like(new_truncated, dtype=bool)
-                    truncated = np.ones_like(new_truncated, dtype=bool)
+                    if gpu_native_rollout:
+                        new_truncated = torch.ones_like(new_truncated, dtype=torch.bool)
+                        truncated = torch.ones_like(new_truncated, dtype=torch.bool)
+                    else:
+                        new_truncated = np.ones_like(new_truncated, dtype=bool)
+                        truncated = np.ones_like(new_truncated, dtype=bool)
 
             if Version(gymnasium.__version__) >= Version("1.0"):
                 if self.cfg.use_trajectory_buffer:
                     data = {
-                        "observation": tree_map(lambda x: x[None, ...], obs),
+                        "observation": tree_map(lambda x: x[None, ...], replay_obs),
                         "action": action[None, ...],
                         "terminated": terminated[None, ..., None],
                         "truncated": truncated[None, ..., None],
-                        "step_count": step_count[None, ..., None],
+                        "step_count": replay_step_count[None, ..., None],
                         "reward": new_reward[None, ..., None],
                     }
                     data["observation"].pop("history", None)
@@ -876,15 +1167,15 @@ class Workspace:
                     # For environments that have reset in the previous step, the new observation corresponds to the state after reset.
                     indexes = ~done
 
-                    real_next_obs = tree_map(lambda x: x.astype(np.float32 if x.dtype == np.float64 else x.dtype)[indexes], new_td)
+                    real_next_obs = tree_map(lambda x: _index_replay_value(x, indexes), new_td)
                     # TODO again, we need to remove "time" from the observation (to stay consistent with obs_space)
                     _ = real_next_obs.pop("time")
                     _ = real_next_obs.pop("history", None)
 
                     data = {
-                        "observation": tree_map(lambda x: x[indexes], obs),
+                        "observation": tree_map(lambda x: x[indexes], replay_obs),
                         "action": action[indexes],
-                        "step_count": step_count[indexes],
+                        "step_count": replay_step_count[indexes],
                         "reward": new_reward[indexes].reshape(-1, 1),
                         "next": {
                             "observation": real_next_obs,
@@ -909,6 +1200,9 @@ class Workspace:
                         }
             else:
                 raise NotImplementedError("still some work to do for gymnasium < 1.0")
+            if self.cfg.buffer_device == "cpu":
+                with profiler.stage("cpu_copy"):
+                    data = tree_map(_to_cpu_replay_value, data)
             if check_rollout_nonfinite:
                 _assert_finite(
                     data,
@@ -918,42 +1212,56 @@ class Workspace:
                     global_time=global_time,
                     optimizer_steps=self._optimizer_steps,
                 )
-            replay_buffer["train"].extend(data)
+            with profiler.stage("replay_extend"):
+                replay_buffer["train"].extend(data)
 
             if len(replay_buffer["train"]) > 0 and local_time > self.cfg.num_seed_steps and update_agent_time_checker.check(local_time):
                 update_agent_time_checker.update_last_step(local_time)
-                for _ in range(self.cfg.num_agent_updates):
-                    metrics = self.agent.update(replay_buffer, local_time)
-                    self._optimizer_steps += 1
-                    if self.cfg.fail_on_nonfinite:
-                        _assert_finite(
-                            metrics,
-                            label="agent.update.metrics",
-                            rank=self.distributed_rank,
-                            local_time=local_time,
-                            global_time=global_time,
-                            optimizer_steps=self._optimizer_steps,
-                        )
-                        if (
-                            self.cfg.nonfinite_check_model_every_updates > 0
-                            and self._optimizer_steps % self.cfg.nonfinite_check_model_every_updates == 0
-                        ):
-                            _assert_model_finite(
-                                self.agent._model,
+                self.agent._runtime_profiler = profiler if profile_this_iteration else None
+                try:
+                    for _ in range(self.cfg.num_agent_updates):
+                        with profiler.stage("agent_update_host"), profiler.stage("agent_update_gpu", cuda=True):
+                            metrics = self.agent.update(replay_buffer, local_time)
+                        self._optimizer_steps += 1
+                        if self.cfg.fail_on_nonfinite:
+                            _assert_finite(
+                                metrics,
+                                label="agent.update.metrics",
                                 rank=self.distributed_rank,
                                 local_time=local_time,
                                 global_time=global_time,
                                 optimizer_steps=self._optimizer_steps,
                             )
-                    if self.cfg.distributed_sync:
-                        sync_floating_buffers(self.agent._model)
-                    if self.cfg.distributed_sync and self.cfg.distributed_average_metrics:
-                        metrics = average_metrics(metrics)
-                    total_metrics, metric_update_counts = _accumulate_metrics(
-                        total_metrics,
-                        metric_update_counts,
-                        metrics,
-                    )
+                            if (
+                                self.cfg.nonfinite_check_model_every_updates > 0
+                                and self._optimizer_steps % self.cfg.nonfinite_check_model_every_updates == 0
+                            ):
+                                _assert_model_finite(
+                                    self.agent._model,
+                                    rank=self.distributed_rank,
+                                    local_time=local_time,
+                                    global_time=global_time,
+                                    optimizer_steps=self._optimizer_steps,
+                                )
+                        if self.cfg.distributed_sync:
+                            sync_floating_buffers(self.agent._model)
+                        if self.cfg.distributed_sync and self.cfg.distributed_average_metrics:
+                            metrics = average_metrics(metrics)
+                        total_metrics, metric_update_counts = _accumulate_metrics(
+                            total_metrics,
+                            metric_update_counts,
+                            metrics,
+                        )
+                finally:
+                    self.agent._runtime_profiler = None
+
+            profile_metrics = profiler.collect()
+            for key, value in profile_metrics.items():
+                runtime_timing_totals[key] += value
+                runtime_timing_counts[key] += 1
+            if self._write_shared_artifacts and "timing/agent_update_gpu_ms" in profile_metrics:
+                formatted_timing = ", ".join(f"{key}={value:.3f}" for key, value in sorted(profile_metrics.items()))
+                print(f"[INFO] Runtime breakdown sample: {formatted_timing}", flush=True)
 
             if log_time_checker.check(global_time) and total_metrics is not None:
                 log_time_checker.update_last_step(global_time)
@@ -961,6 +1269,8 @@ class Workspace:
                 for k in sorted(list(total_metrics.keys())):
                     tmp = total_metrics[k] / metric_update_counts[k]
                     m_dict[k] = np.round(tmp.mean().item(), 6)
+                for key in sorted(runtime_timing_totals):
+                    m_dict[key] = np.round(runtime_timing_totals[key] / runtime_timing_counts[key], 6)
                 m_dict.update(self._get_torso_contact_force_metrics(train_env))
                 m_dict["duration [minutes]"] = (time.time() - start_time) / 60
                 m_dict["FPS"] = (1 if global_time == 0 else self.cfg.log_every_updates) / (time.time() - fps_start_time)
@@ -986,6 +1296,8 @@ class Workspace:
                     print(m_dict)
                 total_metrics = None
                 metric_update_counts = {}
+                runtime_timing_totals = defaultdict(float)
+                runtime_timing_counts = defaultdict(int)
                 fps_start_time = time.time()
                 m_dict["timestep"] = global_time
                 m_dict["local_timestep"] = local_time
@@ -996,8 +1308,15 @@ class Workspace:
             td = new_td
             terminated = new_terminated
             truncated = new_truncated
-            done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
+            if gpu_native_rollout:
+                done = torch.logical_or(new_terminated.reshape(-1), new_truncated.reshape(-1))
+            else:
+                done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
             info = new_info
+        for buffer in replay_buffer.values():
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                close()
         train_env.close()
 
     def eval(self, t, replay_buffer):

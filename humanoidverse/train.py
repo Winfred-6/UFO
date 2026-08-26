@@ -17,7 +17,9 @@ from omegaconf import OmegaConf
 
 def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
     cache_dir = os.environ.get("UFO_CACHE_DIR") or os.environ.get("BFMZERO_MJLAB_CACHE_DIR")
-    root = Path(cache_dir or cache_root or Path.cwd() / "cache").expanduser()
+    root = Path(cache_dir or cache_root or Path.cwd() / "cache").expanduser().resolve()
+    os.environ["UFO_CACHE_DIR"] = str(root)
+    os.environ["BFMZERO_MJLAB_CACHE_DIR"] = str(root)
     for key, subdir in {
         "TMPDIR": "tmp",
         "TEMP": "tmp",
@@ -27,9 +29,28 @@ def _ensure_compile_cache(cache_root: str | Path | None = None) -> None:
         "CUDA_CACHE_PATH": "cuda",
         "WARP_CACHE_PATH": "warp",
     }.items():
-        path = root / subdir
+        configured_path = os.environ.get(key)
+        path = Path(configured_path).expanduser().resolve() if configured_path else root / subdir
         path.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault(key, str(path))
+        os.environ[key] = str(path)
+
+
+def _ensure_rank_compile_cache(rank: int, world_size: int) -> None:
+    """Isolate temporary Inductor/Triton outputs for distributed workers."""
+    if world_size <= 1:
+        return
+    shared_root = Path(os.environ["UFO_CACHE_DIR"]).expanduser().resolve()
+    rank_root = shared_root / "distributed" / f"rank_{rank}"
+    for key, subdir in {
+        "TMPDIR": "tmp",
+        "TEMP": "tmp",
+        "TMP": "tmp",
+        "TORCHINDUCTOR_CACHE_DIR": "torchinductor",
+        "TRITON_CACHE_DIR": "triton",
+    }.items():
+        path = rank_root / subdir
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[key] = str(path)
 
 
 _ensure_compile_cache()
@@ -41,11 +62,15 @@ DEFAULT_CHECKPOINT_EVERY_STEPS = 3200000
 DEFAULT_DATA_PATH = "humanoidverse/data/lafan_29dof_10s-clipped.pkl"
 DEFAULT_WORK_DIR = "runs/ufo"
 DEFAULT_BUFFER_SIZE = 5120000
+DEFAULT_BUFFER_STORAGE = "cpu"
+DEFAULT_BUFFER_PREFETCH = 2
+DEFAULT_BUFFER_PIN_MEMORY_THREADS = 2
 DEFAULT_FB_UPDATE_Z_EVERY_STEP = 100
 DEFAULT_TECH_UPDATE_Z_EVERY_STEP = 10
 DEFAULT_UPDATE_Z_EVERY_STEP = DEFAULT_FB_UPDATE_Z_EVERY_STEP
 DEFAULT_WANDB_PROJECT = "ufo-humanoid"
 DEFAULT_ROBOT_CONFIG = "configs/robots/g1_29dof.yaml"
+DEFAULT_CARRY_MANIFEST = "configs/data/lafan_g1_largebox.yaml"
 
 AGENT_ALIASES = {
     "fb": "fb",
@@ -53,6 +78,7 @@ AGENT_ALIASES = {
     "tldr": "tech",
 }
 
+from humanoidverse.agents.envs.carry_box import CarryBoxConfig
 from humanoidverse.agents.envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from humanoidverse.agents.evaluations.humanoidverse_mjlab import HumanoidVerseMjlabTrackingEvaluationConfig
 from humanoidverse.agents.presets import build_agent_preset
@@ -106,6 +132,12 @@ def build_ufo_mjlab_config(
     data_mix_weights: list[float] | None = None,
     update_z_every_step: int | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
+    buffer_storage: str = DEFAULT_BUFFER_STORAGE,
+    buffer_prefetch: int = DEFAULT_BUFFER_PREFETCH,
+    buffer_pin_memory_threads: int = DEFAULT_BUFFER_PIN_MEMORY_THREADS,
+    gpu_native_rollout: bool = True,
+    runtime_timing_every: int = 0,
+    compile_agent: bool | None = None,
     disable_dr: bool = False,
     disable_obs_noise: bool = False,
     lr_scale: float = 1.0,
@@ -113,8 +145,13 @@ def build_ufo_mjlab_config(
     cartwheel_aux_safe: bool = False,
     num_agent_updates: int | None = None,
     robot_config: str | Path | None = None,
+    task: str = "motion",
+    init_from: str | Path | None = None,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
+    carry_box_enabled = task == "carry_box"
+    if carry_box_enabled and agent != "fb":
+        raise ValueError("task=carry_box currently supports agent=fb only")
     robot_training = load_robot_training_spec(robot_config or DEFAULT_ROBOT_CONFIG)
     try:
         raw_robot_config = OmegaConf.to_container(OmegaConf.load(robot_training.config_path), resolve=True)
@@ -130,6 +167,7 @@ def build_ufo_mjlab_config(
     evaluations = []
     run_eval_and_prioritization = not smoke and not disable_eval_prioritization
     distributed_sync = distributed_world_size > 1
+    compile_enabled = (not distributed_sync) if compile_agent is None else bool(compile_agent)
     if run_eval_and_prioritization:
         evaluations = [
             HumanoidVerseMjlabTrackingEvaluationConfig(
@@ -150,11 +188,12 @@ def build_ufo_mjlab_config(
     selected = build_agent_preset(
         agent=agent,
         device=agent_device,
-        compile=not distributed_sync,
+        compile=compile_enabled,
         update_z_every_step=resolved_update_z_every_step,
         lr_scale=lr_scale,
         clip_grad_norm=clip_grad_norm,
         cartwheel_aux_safe=cartwheel_aux_safe,
+        carry_box=carry_box_enabled,
         wandb_project=DEFAULT_WANDB_PROJECT,
     )
     agent_cfg = selected["agent_cfg"]
@@ -209,8 +248,10 @@ def build_ufo_mjlab_config(
             root_height_obs=True,
             auto_reset=False,
             seed=seed,
+            carry_box=CarryBoxConfig(enabled=carry_box_enabled),
         ),
         work_dir=work_dir,
+        init_from=str(Path(init_from).expanduser().resolve()) if init_from is not None else None,
         seed=seed,
         online_parallel_envs=num_envs,
         log_every_updates=train_runtime["log_every_updates"],
@@ -227,13 +268,20 @@ def build_ufo_mjlab_config(
         prioritization_mode="exp",
         use_trajectory_buffer=train_runtime["use_trajectory_buffer"],
         buffer_size=int(buffer_size),
+        buffer_storage=buffer_storage,
+        buffer_device=device if buffer_storage == "cuda" else "cpu",
+        buffer_sample_device=device,
+        buffer_prefetch=int(buffer_prefetch),
+        buffer_pin_memory_threads=int(buffer_pin_memory_threads),
+        buffer_scratch_dir=str(Path(work_dir) / "replay_memmap" / f"rank_{distributed_rank}"),
+        gpu_native_rollout=bool(gpu_native_rollout),
+        runtime_timing_every=int(runtime_timing_every),
         use_wandb=use_wandb,
         wandb_ename=os.environ.get("WANDB_ENTITY"),
         wandb_gname=wandb_group,
         wandb_pname=wandb_project,
         wandb_run_name=wandb_run_name or f"ufo_{agent}",
         load_expert_data_from_motion_lib=True,
-        buffer_device="cuda" if device.startswith("cuda") else "cpu",
         disable_tqdm=True,
         evaluations=evaluations,
         eval_every_steps=train_runtime["eval_every_steps"],
@@ -244,7 +292,13 @@ def build_ufo_mjlab_config(
         distributed_sync=distributed_sync,
         distributed_global_steps=True,
         distributed_average_metrics=True,
-        tags={"backend": "mjlab", "agent": agent, "distributed_rank": distributed_rank, "distributed_world_size": distributed_world_size},
+        tags={
+            "backend": "mjlab",
+            "agent": agent,
+            "task": task,
+            "distributed_rank": distributed_rank,
+            "distributed_world_size": distributed_world_size,
+        },
     )
 
 
@@ -292,6 +346,7 @@ def _init_distributed(local_rank: int, world_size: int) -> None:
 
 def run_train(args: argparse.Namespace, log_dir: Path) -> None:
     device, _local_rank, rank, world_size = _select_device_and_rank(args.seed)
+    _ensure_rank_compile_cache(rank, world_size)
     _init_distributed(_local_rank, world_size)
     seed = args.seed + rank
     cfg = build_ufo_mjlab_config(
@@ -312,6 +367,12 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         data_mix_weights=args.data_mix_weights,
         update_z_every_step=args.update_z_every_step,
         buffer_size=args.buffer_size,
+        buffer_storage=args.buffer_storage,
+        buffer_prefetch=args.buffer_prefetch,
+        buffer_pin_memory_threads=args.buffer_pin_memory_threads,
+        gpu_native_rollout=args.gpu_native_rollout,
+        runtime_timing_every=args.runtime_timing_every,
+        compile_agent=args.compile_agent,
         disable_dr=bool(args.disable_dr),
         disable_obs_noise=bool(args.disable_obs_noise),
         lr_scale=args.lr_scale,
@@ -319,17 +380,22 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         cartwheel_aux_safe=bool(args.cartwheel_aux_safe),
         num_agent_updates=args.num_agent_updates,
         robot_config=args.robot_config,
+        task=args.task,
+        init_from=args.init_from,
     )
     print(
         "[INFO] UFO train: "
-        f"agent={args.agent}, device={device}, rank={rank}/{world_size}, seed={seed}, work_dir={log_dir}, "
+        f"agent={args.agent}, task={args.task}, device={device}, rank={rank}/{world_size}, seed={seed}, work_dir={log_dir}, "
         f"robot_config={cfg.env.robot_config_path}, mjcf_path={cfg.env.mjcf_path}, "
         f"data_path={cfg.env.lafan_tail_path}, data_mix_weights={cfg.env.data_mix_weights}, "
         f"num_envs_per_rank={args.num_envs}, global_parallel_envs={args.num_envs * world_size}, "
         f"num_env_steps_global={args.num_env_steps}, buffer_size_per_rank={cfg.buffer_size}, "
+        f"buffer_storage={cfg.buffer_storage}, buffer_prefetch={cfg.buffer_prefetch}, "
+        f"gpu_native_rollout={cfg.gpu_native_rollout}, runtime_timing_every={cfg.runtime_timing_every}, "
         f"num_agent_updates={cfg.num_agent_updates}, update_agent_every_local={cfg.update_agent_every}, "
         f"cartwheel_aux_safe={args.cartwheel_aux_safe}, lr_scale={args.lr_scale}, clip_grad_norm={args.clip_grad_norm}, "
         f"disable_dr={cfg.env.disable_domain_randomization}, disable_obs_noise={cfg.env.disable_obs_noise}, "
+        f"init_from={cfg.init_from}, carry_box_mass_kg={cfg.env.carry_box.mass_kg if cfg.env.carry_box.enabled else None}, "
         f"compile={cfg.agent.compile}",
         flush=True,
     )
@@ -408,8 +474,20 @@ def parse_args() -> argparse.Namespace:
         choices=["fb", "tech", "tldr"],
         help="Training agent preset: fb or tech. tldr is a deprecated alias for tech.",
     )
+    parser.add_argument(
+        "--task",
+        choices=["motion", "carry_box"],
+        default="motion",
+        help="Optional task extension. carry_box adds a 0.5 kg box, object observation, goal marker, and carry rewards.",
+    )
     parser.add_argument("--gpu-ids", default="single", help="'single', 'all', or a comma-separated GPU id list relative to CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--work-dir", default=DEFAULT_WORK_DIR)
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        default=None,
+        help="Initialize model weights only from a checkpoint/work directory; optimizer, replay, and counters start fresh.",
+    )
     parser.add_argument(
         "--robot-config",
         type=Path,
@@ -452,7 +530,44 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override latent update interval. Defaults to 100 for FB and 10 for TeCH.",
     )
-    parser.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE, help="Replay capacity per rank/GPU.")
+    parser.add_argument("--buffer-size", type=int, default=DEFAULT_BUFFER_SIZE, help="Replay capacity per training rank.")
+    parser.add_argument(
+        "--buffer-storage",
+        choices=["cpu", "cuda", "memmap"],
+        default=DEFAULT_BUFFER_STORAGE,
+        help="Replay storage tier. CPU is the fast, VRAM-safe default; memmap trades speed for lower RAM use.",
+    )
+    parser.add_argument(
+        "--buffer-prefetch",
+        type=int,
+        default=DEFAULT_BUFFER_PREFETCH,
+        help="Number of replay batches sampled and staged ahead of the optimizer.",
+    )
+    parser.add_argument(
+        "--buffer-pin-memory-threads",
+        type=int,
+        default=DEFAULT_BUFFER_PIN_MEMORY_THREADS,
+        help="Threads used to page-lock a sampled CPU batch before asynchronous H2D transfer; 0 disables parallel pinning.",
+    )
+    parser.add_argument(
+        "--gpu-native-rollout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep MJLab observations/actions on CUDA for policy rollout; only copy data once when writing CPU replay.",
+    )
+    parser.add_argument(
+        "--runtime-timing-every",
+        type=int,
+        default=0,
+        help="Profile one rollout/update group every N environment iterations; 0 disables sampled timing.",
+    )
+    parser.add_argument(
+        "--compile",
+        dest="compile_agent",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override torch.compile. Auto enables it for one GPU and disables it for distributed runs.",
+    )
     parser.add_argument(
         "--num-agent-updates",
         type=int,
@@ -485,11 +600,21 @@ def parse_args() -> argparse.Namespace:
     args.agent = canonical_agent_name(args.agent)
     if raw_agent == "tldr":
         print("WARNING: agent=tldr is deprecated; use agent=tech instead.", file=sys.stderr, flush=True)
+    if args.task == "carry_box" and args.agent != "fb":
+        parser.error("--task carry_box currently requires --agent fb")
+    if args.task == "carry_box" and args.data_manifest is None and args.data_path is None:
+        args.data_manifest = Path(DEFAULT_CARRY_MANIFEST)
     if args.update_z_every_step is None:
         args.update_z_every_step = _default_update_z_every_step(args.agent)
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be positive")
+    if args.num_env_steps <= 0:
+        raise ValueError("--num-env-steps must be positive")
     if args.smoke:
         args.num_envs = min(args.num_envs, 16)
         args.num_env_steps = min(args.num_env_steps, 2048)
+        args.buffer_size = min(args.buffer_size, max(args.num_env_steps, args.num_envs * 2))
+        args.buffer_size = max(args.num_envs * 2, (args.buffer_size // args.num_envs) * args.num_envs)
         args.use_wandb = False
     manifest_robot_config = None
     if args.data_manifest is not None:
@@ -520,6 +645,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--update-z-every-step must be positive")
     if args.buffer_size <= 0:
         raise ValueError("--buffer-size must be positive")
+    if args.buffer_size % args.num_envs:
+        raise ValueError("--buffer-size must be divisible by --num-envs for trajectory replay")
+    if args.buffer_prefetch < 0:
+        raise ValueError("--buffer-prefetch must be non-negative")
+    if args.buffer_pin_memory_threads < 0:
+        raise ValueError("--buffer-pin-memory-threads must be non-negative")
+    if args.runtime_timing_every < 0:
+        raise ValueError("--runtime-timing-every must be non-negative")
     if args.num_agent_updates is not None and args.num_agent_updates <= 0:
         raise ValueError("--num-agent-updates must be positive")
     if args.lr_scale <= 0:
