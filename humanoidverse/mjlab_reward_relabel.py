@@ -23,6 +23,22 @@ from humanoidverse.envs.g1_env_helper import rewards as g1_rewards
 from humanoidverse.envs.g1_env_helper.rewards import RewardFunction
 
 
+CARRY_REWARD_COMPONENTS: dict[str, dict[str, float]] = {
+    "carry-pick": {"carry_approach": 0.2, "carry_pick": 1.0},
+    "carry-transport": {"carry_pick": 0.25, "carry_transport_progress": 1.0},
+    "carry-place": {"carry_transport_progress": 0.25, "carry_success": 1.0},
+    "carry-recover": {"carry_recovery_progress": 1.0, "carry_drop_penalty": -0.25},
+    "carry-full": {
+        "carry_approach": 0.1,
+        "carry_pick": 0.5,
+        "carry_transport_progress": 1.0,
+        "carry_success": 2.0,
+        "carry_recovery_progress": 0.5,
+        "carry_drop_penalty": -0.5,
+    },
+}
+
+
 def get_next(field: str, data: Any):
     if "next" in data and field in data["next"]:
         return data["next"][field]
@@ -107,21 +123,45 @@ class RewardWrapperHV(BaseMjlabRewardWrapper):
     env_model: str | mujoco.MjModel = "humanoidverse/data/robots/g1_mjlab/g1_29dof.xml"
 
     def reward_inference(self, task: str) -> torch.Tensor:
-        if isinstance(self.env_model, str):
-            self.env_model = mujoco.MjModel.from_xml_path(self.env_model)
+        carry_task = task in CARRY_REWARD_COMPONENTS
+        if not carry_task:
+            if isinstance(self.env_model, str):
+                self.env_model = mujoco.MjModel.from_xml_path(self.env_model)
 
-        if isinstance(self.inference_dataset, TrajectoryDictBufferMultiDim):
-            if "qpos" not in self.inference_dataset.output_key_tp1:
-                self.inference_dataset.output_key_tp1.append("qpos")
-            if "qvel" not in self.inference_dataset.output_key_tp1:
-                self.inference_dataset.output_key_tp1.append("qvel")
-        elif isinstance(self.inference_dataset, TorchRLReplayBuffer):
-            self.inference_dataset.include_next_keys("qpos", "qvel")
+            if isinstance(self.inference_dataset, TrajectoryDictBufferMultiDim):
+                if "qpos" not in self.inference_dataset.output_key_tp1:
+                    self.inference_dataset.output_key_tp1.append("qpos")
+                if "qvel" not in self.inference_dataset.output_key_tp1:
+                    self.inference_dataset.output_key_tp1.append("qvel")
+            elif isinstance(self.inference_dataset, TorchRLReplayBuffer):
+                self.inference_dataset.include_next_keys("qpos", "qvel")
 
         if self.num_samples_per_inference >= self.inference_dataset.size() and hasattr(self.inference_dataset, "get_full_buffer"):
             data = self.inference_dataset.get_full_buffer()
         else:
             data = self.inference_dataset.sample(self.num_samples_per_inference)
+
+        if carry_task:
+            if "aux_rewards" not in data:
+                raise ValueError(
+                    f"Carry reward inference task={task!r} requires replay aux_rewards from carry-box training"
+                )
+            aux_rewards = data["aux_rewards"]
+            reward = None
+            for name, scale in CARRY_REWARD_COMPONENTS[task].items():
+                if name not in aux_rewards:
+                    raise ValueError(f"Carry reward inference task={task!r} is missing replay field aux_rewards.{name}")
+                component = aux_rewards[name].to(device=self.device, dtype=torch.float32).reshape(-1)
+                reward = component * float(scale) if reward is None else reward + component * float(scale)
+            td = {"reward": reward}
+            if "B" in data:
+                td["B_vect"] = data["B"]
+            else:
+                td["next_obs"] = get_next("observation", data)
+            inference_fn = getattr(self.model, self.inference_function, None)
+            if inference_fn is None:
+                raise AttributeError(f"Model does not define {self.inference_function!r}")
+            return inference_fn(**td).reshape(1, -1)
 
         qpos = get_next("qpos", data)
         qvel = get_next("qvel", data)

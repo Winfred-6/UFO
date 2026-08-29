@@ -3,7 +3,15 @@
 import numpy as np
 import torch
 
-from humanoidverse.envs.env_utils.history_handler import HistoryHandler as HVHistoryHandler
+from humanoidverse.agents.envs.carry_box import (
+    adaptive_carry_thresholds,
+    box_collision_geometry,
+    carry_task_terms,
+    hand_box_surface_geometry,
+    object_observation,
+    task_latent_command,
+    temporal_object_history,
+)
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
 from humanoidverse.utils.torch_utils import quat_rotate_inverse
 from humanoidverse.utils.reference_observations import reference_base_ang_vel
@@ -17,8 +25,15 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
     episodes = []
     file_names = []
     source_ids = []
-    history_handler = HVHistoryHandler(1, env.config.obs.obs_auxiliary, env.config.obs.obs_dims, device)
     history_config = env.config.obs.obs_auxiliary["history_actor"]
+
+    def previous_history(values: torch.Tensor, history_length: int) -> torch.Tensor:
+        history = values.new_zeros((values.shape[0], history_length, values.shape[-1]))
+        for lag in range(1, history_length + 1):
+            if lag < values.shape[0]:
+                history[lag:, lag - 1] = values[:-lag]
+        return history.reshape(values.shape[0], -1)
+
     for i in range(env._motion_lib._num_unique_motions):
         motion_times = torch.arange(int(np.ceil((env._motion_lib._motion_lengths[i] / env.dt).cpu()))).to(env.device) * env.dt
         motion_id = torch.tensor([i]).to(env.device).repeat(motion_times.shape[0])
@@ -59,30 +74,88 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         )
 
         data = {
+            "actions": bogus_actions,
             "base_ang_vel": ref_ang_vel,
             "projected_gravity": projected_gravity,
             "dof_pos": ref_dof_pos,
             "dof_vel": ref_dof_vel,
         }
 
+        build_history_actor = bool(getattr(env, "carry_box_enabled", False))
+        if build_history_actor:
+            history_actor = torch.cat(
+                [previous_history(data[key], int(history_config[key])) for key in sorted(history_config.keys())],
+                dim=-1,
+            )
         if add_history_noaction:
-            history_handler.reset([0])
-            history_actor = []
-            for ii in range(state.shape[0]):
-                history_tensors = []
-                for key in sorted(history_config.keys()):
-                    if key not in ["action", "actions"]:
-                        history_length = history_config[key]
-                        history_tensor = history_handler.query(key)[:, :history_length]
-                        history_tensor = history_tensor.reshape(history_tensor.shape[0], -1)
-                        history_tensors.append(history_tensor)
-                history_tensors = torch.cat(history_tensors, dim=1)
-                history_actor.append(history_tensors)
+            history_noaction = torch.cat(
+                [
+                    previous_history(data[key], int(history_config[key]))
+                    for key in sorted(history_config.keys())
+                    if key not in {"action", "actions"}
+                ],
+                dim=-1,
+            )
 
-                for key in history_handler.history.keys():
-                    if key not in ["action", "actions"]:
-                        history_handler.add(key, data[key][ii][None, ...])
-            history_actor = torch.stack(history_actor, dim=0).squeeze(1)
+        if build_history_actor:
+            object_frames = object_observation(
+                base_pos=ref_body_pos[:, 0],
+                base_quat_xyzw=base_quat,
+                object_pos=motion_res["object_pos"],
+                object_quat_xyzw=motion_res["object_quat"],
+                valid=motion_res["object_valid"],
+                cfg=env.carry_box_cfg,
+            )
+            object_obs = temporal_object_history(object_frames)
+            task_command = task_latent_command(
+                base_pos=ref_body_pos[:, 0],
+                base_quat_xyzw=base_quat,
+                goal_pos=motion_res["object_goal_pos"],
+                valid=motion_res["object_valid"],
+                cfg=env.carry_box_cfg,
+            )
+            hand_pos = ref_body_pos[:, env.hand_body_indices]
+            hand_distance = hand_box_surface_geometry(
+                hand_pos=hand_pos,
+                object_pos=motion_res["object_pos"],
+                object_quat_xyzw=motion_res["object_quat"],
+                cfg=env.carry_box_cfg,
+            )[0].mean(dim=-1)
+            goal_distance = torch.linalg.vector_norm(
+                motion_res["object_goal_pos"] - motion_res["object_pos"],
+                dim=-1,
+            )
+            _center, bottom_height, _axes = box_collision_geometry(
+                object_pos=motion_res["object_pos"],
+                object_quat_xyzw=motion_res["object_quat"],
+                cfg=env.carry_box_cfg,
+            )
+            lift_height = adaptive_carry_thresholds(env.carry_box_cfg)["lift_height"]
+            lift_fraction = torch.clamp(bottom_height / lift_height, min=0.0, max=1.0)
+
+            def previous_current(value: torch.Tensor) -> torch.Tensor:
+                return torch.cat([value[:1], value[:-1]], dim=0)
+
+            ever_lifted = torch.cumsum(
+                ((lift_fraction >= 1.0) & (motion_res["object_valid"][:, 0] > 0.5)).long(),
+                dim=0,
+            ) > 0
+            carry_aux_rewards, _carry_state = carry_task_terms(
+                hand_pos=hand_pos,
+                bilateral_contact=torch.zeros(len(hand_pos), dtype=torch.bool, device=hand_pos.device),
+                object_pos=motion_res["object_pos"],
+                object_quat_xyzw=motion_res["object_quat"],
+                object_lin_vel=motion_res["object_lin_vel"],
+                object_ang_vel=motion_res["object_ang_vel"],
+                goal_pos=motion_res["object_goal_pos"],
+                valid=motion_res["object_valid"][:, 0],
+                ground_height=torch.zeros(len(hand_pos), device=hand_pos.device),
+                ever_lifted=ever_lifted,
+                prev_hand_distance=previous_current(hand_distance),
+                prev_goal_distance=previous_current(goal_distance),
+                prev_lift_fraction=previous_current(lift_fraction),
+                cfg=env.carry_box_cfg,
+            )
 
         curr_motion_len = state.shape[0]
         truncated = torch.zeros(curr_motion_len, dtype=bool).to(env.device)
@@ -96,10 +169,14 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             f"{env._motion_lib._motion_data_keys[i]}: {bogus_actions.shape[0]} vs {curr_motion_len}"
         )
         assert truncated.shape[0] == curr_motion_len, f"{env._motion_lib._motion_data_keys[i]}: {truncated.shape[0]} vs {curr_motion_len}"
-        if add_history_noaction:
+        if build_history_actor:
             assert history_actor.shape[0] == curr_motion_len, (
                 f"{env._motion_lib._motion_data_keys[i]}: {history_actor.shape[0]} vs {curr_motion_len}"
             )
+            assert object_obs.shape[0] == curr_motion_len
+            assert task_command.shape[0] == curr_motion_len
+        if add_history_noaction:
+            assert history_noaction.shape[0] == curr_motion_len
 
         ep = {
             "observation": {
@@ -111,8 +188,16 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
             "truncated": truncated,
             "motion_id": torch.ones(curr_motion_len, dtype=torch.long) * i,
         }
+        if build_history_actor:
+            ep["observation"]["history_actor"] = history_actor
+            ep["observation"]["object_obs"] = object_obs
+            ep["observation"]["task_command"] = task_command
+            ep["aux_rewards"] = {
+                key: value.unsqueeze(-1)
+                for key, value in carry_aux_rewards.items()
+            }
         if add_history_noaction:
-            ep["observation"]["history_noaction"] = history_actor
+            ep["observation"]["history_noaction"] = history_noaction
         episodes.append(ep)
 
     expert_buffer = TrajectoryDictBuffer(
@@ -121,6 +206,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         device=device,
         source_ids=source_ids,
         source_weights=env._motion_lib._motion_source_weights.detach().cpu().tolist(),
+        output_key_t=["observation", "aux_rewards"] if bool(getattr(env, "carry_box_enabled", False)) else ["observation"],
     )
 
     assert expert_buffer.storage["observation"]["state"].shape[0] == expert_buffer.storage["truncated"].shape[0]

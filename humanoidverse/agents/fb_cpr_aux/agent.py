@@ -4,8 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import typing as tp
+from collections.abc import Mapping
 from contextlib import nullcontext
-from typing import Dict
+from typing import Any, Dict
 
 import pydantic
 import torch
@@ -13,10 +14,10 @@ import torch.nn.functional as F
 from torch.amp import autocast
 from torch.utils._pytree import tree_map
 
+from ...distributed import average_gradients
 from ..base import BaseConfig
 from ..fb_cpr.agent import FBcprAgent, FBcprAgentTrainConfig
 from ..nn_models import _soft_update_params, eval_mode
-from ...distributed import average_gradients
 from .model import FBcprAuxModelConfig
 
 
@@ -35,6 +36,7 @@ class FBcprAuxAgentConfig(BaseConfig):
     aux_rewards_scaling: dict[str, float] = pydantic.Field(default_factory=dict)
     cudagraphs: bool = False
     compile: bool = False
+    fail_fast_diagnostics: bool = False
 
     def build(self, obs_space, action_dim: int) -> "FBcprAuxAgent":
         return self.object_class(
@@ -50,6 +52,66 @@ class FBcprAuxAgentConfig(BaseConfig):
 
 class FBcprAuxAgent(FBcprAgent):
     config_class = FBcprAuxAgentConfig
+
+    @staticmethod
+    def _iter_diagnostic_tensors(value: Any, prefix: str = ""):
+        if isinstance(value, torch.Tensor):
+            yield prefix or "<tensor>", value
+        elif isinstance(value, Mapping):
+            for key, child in value.items():
+                child_prefix = f"{prefix}.{key}" if prefix else str(key)
+                yield from FBcprAuxAgent._iter_diagnostic_tensors(child, child_prefix)
+        elif isinstance(value, (tuple, list)):
+            for index, child in enumerate(value):
+                yield from FBcprAuxAgent._iter_diagnostic_tensors(child, f"{prefix}[{index}]")
+
+    def _diagnostic_assert_finite(self, value: Any, label: str, step: int) -> None:
+        if not self.cfg.fail_fast_diagnostics:
+            return
+        failures = []
+        for name, tensor in self._iter_diagnostic_tensors(value):
+            if not tensor.is_floating_point():
+                continue
+            finite = torch.isfinite(tensor)
+            if bool(torch.all(finite).item()):
+                continue
+            bad = (~finite).nonzero(as_tuple=False)
+            finite_values = tensor[finite]
+            failures.append(
+                {
+                    "name": name,
+                    "shape": tuple(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "bad_count": int((~finite).sum().item()),
+                    "first_bad_index": bad[0].detach().cpu().tolist(),
+                    "first_bad_value": tensor[tuple(bad[0].tolist())].detach().cpu().item(),
+                    "finite_min": float(finite_values.min().item()) if finite_values.numel() else None,
+                    "finite_max": float(finite_values.max().item()) if finite_values.numel() else None,
+                    "finite_max_abs": float(finite_values.abs().max().item()) if finite_values.numel() else None,
+                }
+            )
+        if failures:
+            raise FloatingPointError(f"FB raw-update fail-fast: step={step}, label={label}, failures={failures}")
+
+    def _diagnostic_assert_module(self, module: torch.nn.Module, label: str, step: int) -> None:
+        if not self.cfg.fail_fast_diagnostics:
+            return
+        state = {f"parameter.{name}": value for name, value in module.named_parameters()}
+        state.update({f"buffer.{name}": value for name, value in module.named_buffers()})
+        floating = {name: value for name, value in state.items() if value.is_floating_point()}
+        if not floating:
+            return
+        # Keep the healthy path to one synchronization per module.  Detailed
+        # tensor inspection is only paid for after a failure is detected.
+        bad_flags = torch.stack([~torch.isfinite(value).all() for value in floating.values()])
+        if not bool(torch.any(bad_flags).item()):
+            return
+        bad_state = {
+            name: value
+            for (name, value), is_bad in zip(floating.items(), bad_flags.tolist())
+            if is_bad
+        }
+        self._diagnostic_assert_finite(bad_state, label, step)
 
     def setup_training(self) -> None:
         super().setup_training()
@@ -91,6 +153,9 @@ class FBcprAuxAgent(FBcprAgent):
         with stage("replay_sample"):
             expert_batch = replay_buffer["expert_slicer"].sample(self.cfg.train.batch_size)
             train_batch = replay_buffer["train"].sample(self.cfg.train.batch_size)
+        self._diagnostic_assert_finite(expert_batch, "raw_expert_batch", step)
+        self._diagnostic_assert_finite(train_batch, "raw_train_batch", step)
+        self._diagnostic_assert_module(self._model._obs_normalizer, "obs_normalizer_before_update", step)
 
         with stage("update_prepare", cuda=True):
             train_obs, train_action, train_next_obs = (
@@ -106,6 +171,7 @@ class FBcprAuxAgent(FBcprAgent):
 
             self._model._obs_normalizer(train_obs)
             self._model._obs_normalizer(train_next_obs)
+            self._diagnostic_assert_module(self._model._obs_normalizer, "obs_normalizer_after_update", step)
 
             with torch.no_grad(), eval_mode(self._model._obs_normalizer):
                 train_obs, train_next_obs = (
@@ -116,36 +182,70 @@ class FBcprAuxAgent(FBcprAgent):
                     self._model._obs_normalizer(expert_obs),
                     self._model._obs_normalizer(expert_next_obs),
                 )
+            self._diagnostic_assert_finite(
+                {
+                    "train_obs": train_obs,
+                    "train_next_obs": train_next_obs,
+                    "expert_obs": expert_obs,
+                    "expert_next_obs": expert_next_obs,
+                },
+                "normalized_observations",
+                step,
+            )
 
             torch.compiler.cudagraph_mark_step_begin()
             expert_z = self.encode_expert(next_obs=expert_next_obs)
             train_z = train_batch["z"].to(self.device)
+            train_z = self._model.condition_task_latent(train_z, train_obs)
+            self._diagnostic_assert_finite({"expert_z": expert_z, "train_z": train_z}, "initial_latents", step)
 
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
+        mismatch_obs = None
+        mismatch_z = None
+        mismatch_coef = 0.0
+        if self.cfg.train.balanced_object_discriminator:
+            expert_disc_obs, expert_disc_z, expert_gate = self._balanced_discriminator_batch(expert_obs, expert_z)
+            train_disc_obs, train_disc_z, train_gate = self._balanced_discriminator_batch(train_obs, train_z)
+            mismatch_obs = self._mismatched_object_negative(expert_disc_obs, expert_gate)
+            mismatch_z = expert_disc_z
+            mismatch_coef = float(self.cfg.train.discriminator_mismatch_coef)
+        else:
+            expert_disc_obs, expert_disc_z = expert_obs, expert_z
+            train_disc_obs, train_disc_z = train_obs, train_z
+            expert_gate = train_gate = None
         with stage("discriminator", cuda=True):
             metrics = self.update_discriminator(
-                expert_obs=expert_obs,
-                expert_z=expert_z,
-                train_obs=train_obs,
-                train_z=train_z,
+                expert_obs=expert_disc_obs,
+                expert_z=expert_disc_z,
+                train_obs=train_disc_obs,
+                train_z=train_disc_z,
                 grad_penalty=grad_penalty,
+                mismatch_obs=mismatch_obs,
+                mismatch_z=mismatch_z,
+                mismatch_coef=mismatch_coef,
             )
+        if expert_gate is not None:
+            metrics["disc_expert_carry_fraction"] = expert_gate.float().mean()
+            metrics["disc_train_carry_fraction"] = train_gate.float().mean()
+        self._diagnostic_assert_finite(metrics, "discriminator_metrics", step)
+        self._diagnostic_assert_module(self._model._discriminator, "discriminator_after_update", step)
 
         with stage("latent_prepare", cuda=True):
             z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
             self.z_buffer.add(z)
+            self._diagnostic_assert_finite(z, "mixed_latent", step)
 
             if self.cfg.train.relabel_ratio is not None:
                 mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
                 train_z = torch.where(mask, z, train_z)
+            train_z = self._model.condition_task_latent(train_z, train_obs)
 
         q_loss_coef = self.cfg.train.q_loss_coef if self.cfg.train.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.train.clip_grad_norm if self.cfg.train.clip_grad_norm > 0 else None
 
         with stage("fb", cuda=True):
-            metrics.update(
-                self.update_fb(
+            fb_metrics = self.update_fb(
                     obs=train_obs,
                     action=train_action,
                     discount=discount,
@@ -155,17 +255,21 @@ class FBcprAuxAgent(FBcprAgent):
                     q_loss_coef=q_loss_coef,
                     clip_grad_norm=clip_grad_norm,
                 )
-            )
+            self._diagnostic_assert_finite(fb_metrics, "fb_metrics", step)
+            metrics.update(fb_metrics)
+        self._diagnostic_assert_module(self._model._forward_map, "forward_map_after_update", step)
+        self._diagnostic_assert_module(self._model._backward_map, "backward_map_after_update", step)
         with stage("critic", cuda=True):
-            metrics.update(
-                self.update_critic(
+            critic_metrics = self.update_critic(
                     obs=train_obs,
                     action=train_action,
                     discount=discount,
                     next_obs=train_next_obs,
                     z=train_z,
                 )
-            )
+            self._diagnostic_assert_finite(critic_metrics, "critic_metrics", step)
+            metrics.update(critic_metrics)
+        self._diagnostic_assert_module(self._model._critic, "critic_after_update", step)
         # compute scalar auxiliary reward as a weighted sum of the auxiliary rewards
         with stage("aux_reward_prepare", cuda=True):
             aux_reward = torch.zeros(
@@ -178,11 +282,13 @@ class FBcprAuxAgent(FBcprAgent):
                 metrics[f"aux_rew/{aux_reward_name}"] = train_batch["aux_rewards"][aux_reward_name].mean()
                 aux_reward += self.cfg.aux_rewards_scaling[aux_reward_name] * train_batch["aux_rewards"][aux_reward_name].to(self.device)
 
+            self._diagnostic_assert_finite(aux_reward, "raw_weighted_aux_reward", step)
             aux_reward = self._model._aux_reward_normalizer(aux_reward)
+            self._diagnostic_assert_finite(aux_reward, "normalized_aux_reward", step)
+            self._diagnostic_assert_module(self._model._aux_reward_normalizer, "aux_reward_normalizer", step)
 
         with stage("aux_critic", cuda=True):
-            metrics.update(
-                self.update_aux_critic(
+            aux_critic_metrics = self.update_aux_critic(
                     obs=train_obs,
                     action=train_action,
                     discount=discount,
@@ -190,16 +296,19 @@ class FBcprAuxAgent(FBcprAgent):
                     next_obs=train_next_obs,
                     z=train_z,
                 )
-            )
+            self._diagnostic_assert_finite(aux_critic_metrics, "aux_critic_metrics", step)
+            metrics.update(aux_critic_metrics)
+        self._diagnostic_assert_module(self._model._aux_critic, "aux_critic_after_update", step)
         with stage("actor", cuda=True):
-            metrics.update(
-                self.update_actor(
+            actor_metrics = self.update_actor(
                     obs=train_obs,
                     action=train_action,
                     z=train_z,
                     clip_grad_norm=clip_grad_norm,
                 )
-            )
+            self._diagnostic_assert_finite(actor_metrics, "actor_metrics", step)
+            metrics.update(actor_metrics)
+        self._diagnostic_assert_module(self._model._actor, "actor_after_update", step)
 
         with stage("target_update", cuda=True), torch.no_grad():
             _soft_update_params(

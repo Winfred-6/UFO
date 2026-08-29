@@ -7,41 +7,52 @@ MJLab owns batched physics stepping; this wrapper reconstructs the observation,
 reward, reset and info dictionaries expected by the original UFO code.
 """
 
+import math
 import os
 import random
 import typing as tp
 from pathlib import Path
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Union
 
 import gymnasium
 import hydra
-import humanoidverse
 import numpy as np
 import pydantic
 import torch
 from gymnasium import Env
 from gymnasium.vector import VectorEnv
+from loguru import logger
 from omegaconf import OmegaConf
 from torch.utils._pytree import tree_map
 
+import humanoidverse
 from humanoidverse.agents.base import BaseConfig
 from humanoidverse.agents.envs.carry_box import (
+    CARRY_STAGE_COUNT,
+    CARRY_STAGE_NAMES,
     CarryBoxConfig,
+    OBJECT_FRAME_DIM,
+    OBJECT_HISTORY_STEPS,
+    adaptive_carry_thresholds,
+    box_collision_geometry,
     build_carry_box_scene_parts,
+    carry_task_terms,
+    hand_box_surface_geometry,
     object_observation,
+    parked_box_local_position,
+    task_latent_command,
 )
 from humanoidverse.envs.env_utils.history_handler import HistoryHandler as HVHistoryHandler
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
 from humanoidverse.utils.helpers import pre_process_config
 from humanoidverse.utils.motion_lib.motion_lib_robot import MotionLibRobot
 from humanoidverse.utils.torch_utils import (
-    calc_heading_quat_inv,
     my_quat_rotate,
     quat_from_angle_axis,
     quat_mul,
     quat_rotate_inverse,
-    wxyz_to_xyzw,
     wrap_to_pi,
+    wxyz_to_xyzw,
     xyzw_to_wxyz,
 )
 
@@ -699,6 +710,14 @@ class HumanoidVerseMjlabCore:
             self.object_ever_lifted = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self.prev_hand_box_distance = torch.zeros(self.num_envs, device=self.device)
             self.prev_box_goal_distance = torch.zeros(self.num_envs, device=self.device)
+            self.prev_box_lift_fraction = torch.zeros(self.num_envs, device=self.device)
+            self.object_reset_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self.object_obs_history = torch.zeros(
+                self.num_envs,
+                OBJECT_HISTORY_STEPS,
+                OBJECT_FRAME_DIM,
+                device=self.device,
+            )
 
         lower = torch.tensor(_to_list(hv_config.robot.dof_pos_lower_limit_list), dtype=torch.float32, device=self.device)
         upper = torch.tensor(_to_list(hv_config.robot.dof_pos_upper_limit_list), dtype=torch.float32, device=self.device)
@@ -744,6 +763,10 @@ class HumanoidVerseMjlabCore:
         self.simulator = _MjlabSimulatorView(self)
 
         self._refresh_state()
+        if self.carry_box_enabled:
+            self._reset_carry_observation_history(
+                torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+            )
         self.simulator.refresh()
 
     def _init_reward_scales(self) -> None:
@@ -825,6 +848,42 @@ class HumanoidVerseMjlabCore:
         self.config.robot.motion.step_dt = self.dt
         self._motion_lib = MotionLibRobot(self.config.robot.motion, num_envs=self.num_envs, device=self.device)
         self._motion_lib.load_motions_for_training(max_num_seqs=self.num_envs)
+        if self.carry_box_enabled and self.carry_box_cfg.require_safe_reset_mask:
+            object_motions = self._motion_lib._motion_has_object
+            use_stage_curriculum = bool(self.carry_box_cfg.stage_reset_curriculum)
+            if use_stage_curriculum:
+                stage_counts = self._motion_lib._stage_reset_valid_frame_counts[:, 1:CARRY_STAGE_COUNT]
+                safe_object_motions = object_motions & (stage_counts.sum(dim=1) > 0)
+            else:
+                stage_counts = None
+                safe_object_motions = object_motions & (self._motion_lib._reset_valid_frame_counts > 0)
+            if not torch.any(object_motions):
+                raise ValueError("carry_box task loaded no object-bearing motions")
+            if not torch.any(safe_object_motions):
+                raise ValueError(
+                    "carry_box motions contain no certified reset frames for the configured curriculum; "
+                    "run the carry-box staged physics certification before training"
+                )
+            if use_stage_curriculum:
+                stage_summary = ", ".join(
+                    f"{CARRY_STAGE_NAMES[stage]}={int(stage_counts[:, stage - 1].sum().item())}"
+                    for stage in range(1, CARRY_STAGE_COUNT)
+                )
+                logger.info(
+                    "[carry-box] staged physics-safe reset motions={safe}/{total}, frames=({summary})".format(
+                        safe=int(safe_object_motions.sum().item()),
+                        total=int(object_motions.sum().item()),
+                        summary=stage_summary,
+                    )
+                )
+            else:
+                logger.info(
+                    "[carry-box] physics-safe reset motions={safe}/{total}, reset_frames={frames}".format(
+                        safe=int(safe_object_motions.sum().item()),
+                        total=int(object_motions.sum().item()),
+                        frames=int(self._motion_lib._reset_valid_frame_counts[safe_object_motions].sum().item()),
+                    )
+                )
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.motion_len = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -854,11 +913,53 @@ class HumanoidVerseMjlabCore:
         if len(env_ids) == 0:
             return
         self.motion_ids[env_ids] = self._motion_lib.sample_motions(len(env_ids))
+        safe_object_resets = self.carry_box_enabled and self.carry_box_cfg.require_safe_reset_mask
+        staged_object_resets = safe_object_resets and bool(self.carry_box_cfg.stage_reset_curriculum)
+        if safe_object_resets and not self.is_evaluating:
+            for _ in range(64):
+                selected = self.motion_ids[env_ids]
+                if staged_object_resets:
+                    valid_count = self._motion_lib._stage_reset_valid_frame_counts[
+                        selected, 1:CARRY_STAGE_COUNT
+                    ].sum(dim=1)
+                else:
+                    valid_count = self._motion_lib._reset_valid_frame_counts[selected]
+                invalid = self._motion_lib._motion_has_object[selected] & (valid_count <= 0)
+                if not torch.any(invalid):
+                    break
+                invalid_env_ids = env_ids[invalid]
+                self.motion_ids[invalid_env_ids] = self._motion_lib.sample_motions(len(invalid_env_ids))
+            else:
+                raise RuntimeError("Could not sample a carry-box motion with a certified physics-safe reset frame")
         self.motion_len[env_ids] = self._motion_lib.get_motion_length(self.motion_ids[env_ids])
         if self.is_evaluating and not self.config.enforce_randomize_motion_start_eval:
             self.motion_start_times[env_ids] = 0.0
+            if self.carry_box_enabled:
+                self.object_reset_stage[env_ids] = 0
         else:
             self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
+            if safe_object_resets:
+                selected = self.motion_ids[env_ids]
+                object_mask = self._motion_lib._motion_has_object[selected]
+                if torch.any(object_mask):
+                    object_env_ids = env_ids[object_mask]
+                    if staged_object_resets:
+                        stage_probabilities = torch.as_tensor(
+                            (0.0, *self.carry_box_cfg.stage_reset_probabilities),
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        reset_times, reset_stages = self._motion_lib.sample_stage_reset_time(
+                            selected[object_mask],
+                            stage_probabilities,
+                        )
+                        self.motion_start_times[object_env_ids] = reset_times
+                        self.object_reset_stage[object_env_ids] = reset_stages
+                    else:
+                        self.motion_start_times[object_env_ids] = self._motion_lib.sample_reset_time(selected[object_mask])
+                        self.object_reset_stage[object_env_ids] = 0
+                if self.carry_box_enabled:
+                    self.object_reset_stage[env_ids[~object_mask]] = 0
 
     def _randomize_default_dof_pos_offset(self, env_ids: torch.Tensor) -> None:
         if bool(self.config.domain_rand.get("randomize_default_dof_pos", False)):
@@ -917,32 +1018,178 @@ class HumanoidVerseMjlabCore:
         contact |= force > float(self.carry_box_cfg.grasp_force_threshold)
         return contact, force
 
+    def _assert_carry_physics_sane(self, phase: str) -> None:
+        """Fail at the first corrupt/nonphysical carry state without altering it.
+
+        This diagnostic is intentionally isolated behind an opt-in flag.  It
+        never clamps, resets, terminates, or drops an environment; its only
+        effect is to preserve the first physical failure site before a bad
+        transition can reach replay or observation normalization.
+        """
+
+        if not self.carry_box_enabled or not self.carry_box_cfg.fail_fast_diagnostics:
+            return
+
+        tensor_fields = {
+            "actions": self.actions,
+            "robot_root_states": self.robot_root_states,
+            "dof_pos": self.dof_pos,
+            "dof_vel": self.dof_vel,
+            "body_pos": self.body_pos,
+            "body_rot": self.body_rot,
+            "body_vel": self.body_vel,
+            "body_ang_vel": self.body_ang_vel,
+            "torques": self.torques,
+            "contact_forces": self.contact_forces,
+            "object_pos": self.object_pos,
+            "object_quat": self.object_quat,
+            "object_lin_vel": self.object_lin_vel,
+            "object_ang_vel": self.object_ang_vel,
+            "object_goal_pos": self.object_goal_pos,
+            "object_valid": self.object_valid,
+            "hand_box_force": self.hand_box_force,
+        }
+        failures: dict[str, torch.Tensor] = {}
+        bad_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for name, value in tensor_fields.items():
+            if not value.is_floating_point():
+                continue
+            field_bad = ~torch.isfinite(value).reshape(self.num_envs, -1).all(dim=1)
+            failures[f"nonfinite/{name}"] = field_bad
+            bad_envs |= field_bad
+
+        object_active = self.object_valid[:, 0] > 0.5
+        threshold_values = {
+            "object_linear_speed": torch.linalg.vector_norm(self.object_lin_vel, dim=-1),
+            "object_angular_speed": torch.linalg.vector_norm(self.object_ang_vel, dim=-1),
+            "body_linear_speed": torch.linalg.vector_norm(self.body_vel, dim=-1).amax(dim=1),
+            "body_angular_speed": torch.linalg.vector_norm(self.body_ang_vel, dim=-1).amax(dim=1),
+            "dof_speed": torch.abs(self.dof_vel).amax(dim=1),
+            "torque": torch.abs(self.torques).amax(dim=1),
+            "contact_force": torch.linalg.vector_norm(self.contact_forces, dim=-1).amax(dim=1),
+            "hand_box_force": torch.abs(self.hand_box_force).amax(dim=1),
+            "object_robot_distance": torch.abs(self.object_pos - self.robot_root_states[:, :3]).amax(dim=1),
+        }
+        thresholds = {
+            "object_linear_speed": float(self.carry_box_cfg.diagnostic_max_object_linear_speed),
+            "object_angular_speed": float(self.carry_box_cfg.diagnostic_max_object_angular_speed),
+            "body_linear_speed": float(self.carry_box_cfg.diagnostic_max_body_linear_speed),
+            "body_angular_speed": float(self.carry_box_cfg.diagnostic_max_body_angular_speed),
+            "dof_speed": float(self.carry_box_cfg.diagnostic_max_dof_speed),
+            "torque": float(self.carry_box_cfg.diagnostic_max_torque),
+            "contact_force": float(self.carry_box_cfg.diagnostic_max_contact_force),
+            "hand_box_force": float(self.carry_box_cfg.diagnostic_max_contact_force),
+            "object_robot_distance": float(self.carry_box_cfg.diagnostic_max_relative_position),
+        }
+        for name, value in threshold_values.items():
+            field_bad = value > thresholds[name]
+            if name.startswith("object_") or name == "hand_box_force":
+                field_bad &= object_active
+            failures[f"limit/{name}"] = field_bad
+            bad_envs |= field_bad
+
+        if not bool(torch.any(bad_envs).item()):
+            return
+
+        env_id = int(bad_envs.nonzero(as_tuple=False)[0, 0].item())
+        triggered = [name for name, mask in failures.items() if bool(mask[env_id].item())]
+        motion_id = int(self.motion_ids[env_id].item())
+        motion_keys = list(self._motion_lib.curr_motion_keys)
+        motion_key = motion_keys[motion_id] if 0 <= motion_id < len(motion_keys) else "<unknown>"
+        episode_step = int(self.episode_length_buf[env_id].item())
+        motion_start_time = float(self.motion_start_times[env_id].item())
+        reference_time = motion_start_time + episode_step * self.dt
+
+        dof_speed, dof_index = torch.abs(self.dof_vel[env_id]).max(dim=0)
+        body_speed, body_index = torch.linalg.vector_norm(self.body_vel[env_id], dim=-1).max(dim=0)
+        body_ang_speed, body_ang_index = torch.linalg.vector_norm(self.body_ang_vel[env_id], dim=-1).max(dim=0)
+        contact_force, contact_index = torch.linalg.vector_norm(self.contact_forces[env_id], dim=-1).max(dim=0)
+        details = {
+            "phase": phase,
+            "env_id": env_id,
+            "motion_id": motion_id,
+            "motion_key": motion_key,
+            "motion_start_time": motion_start_time,
+            "episode_step": episode_step,
+            "reference_time": reference_time,
+            "object_valid": float(self.object_valid[env_id, 0].item()),
+            "triggered": triggered,
+            "root_state": self.robot_root_states[env_id].detach().cpu().tolist(),
+            "object_pos": self.object_pos[env_id].detach().cpu().tolist(),
+            "object_quat_xyzw": self.object_quat[env_id].detach().cpu().tolist(),
+            "object_lin_vel": self.object_lin_vel[env_id].detach().cpu().tolist(),
+            "object_ang_vel": self.object_ang_vel[env_id].detach().cpu().tolist(),
+            "object_goal_pos": self.object_goal_pos[env_id].detach().cpu().tolist(),
+            "hand_box_force": self.hand_box_force[env_id].detach().cpu().tolist(),
+            "max_dof_speed": (float(dof_speed.item()), self.dof_names[int(dof_index.item())]),
+            "max_body_speed": (float(body_speed.item()), self.body_names[int(body_index.item())]),
+            "max_body_angular_speed": (float(body_ang_speed.item()), self.body_names[int(body_ang_index.item())]),
+            "max_contact_force": (float(contact_force.item()), self.body_names[int(contact_index.item())]),
+            "max_torque": float(torch.abs(self.torques[env_id]).max().item()),
+            "max_action": float(torch.abs(self.actions[env_id]).max().item()),
+        }
+        raise FloatingPointError(f"Carry-box physics fail-fast diagnostic: {details}")
+
     def _object_observation(self) -> torch.Tensor:
+        return self.object_obs_history.reshape(self.num_envs, -1)
+
+    def _current_object_frame(self) -> torch.Tensor:
         return object_observation(
             base_pos=self.robot_root_states[:, :3],
             base_quat_xyzw=self.base_quat,
-            base_lin_vel_world=self.base_lin_vel_world,
-            base_ang_vel_world=self.base_ang_vel_world,
             object_pos=self.object_pos,
             object_quat_xyzw=self.object_quat,
-            object_lin_vel_world=self.object_lin_vel,
-            object_ang_vel_world=self.object_ang_vel,
+            valid=self.object_valid,
+            cfg=self.carry_box_cfg,
+        )
+
+    def _task_latent_command(self) -> torch.Tensor:
+        return task_latent_command(
+            base_pos=self.robot_root_states[:, :3],
+            base_quat_xyzw=self.base_quat,
             goal_pos=self.object_goal_pos,
             valid=self.object_valid,
             cfg=self.carry_box_cfg,
         )
 
+    def _reset_carry_observation_history(self, env_ids: torch.Tensor) -> None:
+        if not self.carry_box_enabled or len(env_ids) == 0:
+            return
+        current = self._current_object_frame()[env_ids]
+        self.object_obs_history[env_ids] = 0.0
+        self.object_obs_history[env_ids, 0] = current
+
+    def _advance_carry_observation_history(self) -> None:
+        if not self.carry_box_enabled:
+            return
+        previous = self.object_obs_history.clone()
+        self.object_obs_history[:, 1:] = previous[:, :-1]
+        self.object_obs_history[:, 0] = self._current_object_frame()
+
     def _reset_carry_progress(self, env_ids: torch.Tensor) -> None:
         if not self.carry_box_enabled or len(env_ids) == 0:
             return
-        hand_distance = torch.linalg.vector_norm(
-            self.body_pos[env_ids][:, self.hand_body_indices] - self.object_pos[env_ids, None, :], dim=-1
-        ).mean(dim=-1)
+        surface_distance, _opposite_quality = hand_box_surface_geometry(
+            hand_pos=self.body_pos[env_ids][:, self.hand_body_indices],
+            object_pos=self.object_pos[env_ids],
+            object_quat_xyzw=self.object_quat[env_ids],
+            cfg=self.carry_box_cfg,
+        )
+        hand_distance = surface_distance.mean(dim=-1)
         self.prev_hand_box_distance[env_ids] = hand_distance
         self.prev_box_goal_distance[env_ids] = torch.linalg.vector_norm(
             self.object_goal_pos[env_ids] - self.object_pos[env_ids], dim=-1
         )
-        lifted = self.object_pos[env_ids, 2] > self.object_goal_pos[env_ids, 2] + float(self.carry_box_cfg.lift_height)
+        _center, bottom_height, _axes = box_collision_geometry(
+            object_pos=self.object_pos[env_ids],
+            object_quat_xyzw=self.object_quat[env_ids],
+            cfg=self.carry_box_cfg,
+        )
+        lift_clearance = bottom_height - self.env_origins[env_ids, 2]
+        lift_height = adaptive_carry_thresholds(self.carry_box_cfg)["lift_height"]
+        lift_fraction = torch.clamp(lift_clearance / lift_height, min=0.0, max=1.0)
+        self.prev_box_lift_fraction[env_ids] = lift_fraction
+        lifted = lift_fraction >= 1.0
         self.object_ever_lifted[env_ids] = lifted & self.object_valid[env_ids, 0].bool()
 
     def _read_contact_forces(self) -> torch.Tensor:
@@ -1046,6 +1293,9 @@ class HumanoidVerseMjlabCore:
         }
         if self.carry_box_enabled:
             obs["object_obs"] = self._object_observation()
+            # This key is consumed only by the structured reward/task latent
+            # adapter.  Actor/F/critics never concatenate it as observation.
+            obs["task_command"] = self._task_latent_command()
         if include_last_action:
             obs["last_action"] = raw_obs["actions"]
         obs["time"] = self.episode_length_buf.unsqueeze(-1)
@@ -1094,44 +1344,27 @@ class HumanoidVerseMjlabCore:
         )
 
         if self.carry_box_enabled:
-            valid = self.object_valid[:, 0]
-            hand_distance_each = torch.linalg.vector_norm(
-                self.body_pos[:, self.hand_body_indices] - self.object_pos[:, None, :], dim=-1
+            carry_aux, carry_state = carry_task_terms(
+                hand_pos=self.body_pos[:, self.hand_body_indices],
+                bilateral_contact=torch.all(self.hand_box_contact, dim=-1),
+                object_pos=self.object_pos,
+                object_quat_xyzw=self.object_quat,
+                object_lin_vel=self.object_lin_vel,
+                object_ang_vel=self.object_ang_vel,
+                goal_pos=self.object_goal_pos,
+                valid=self.object_valid[:, 0],
+                ground_height=self.env_origins[:, 2],
+                ever_lifted=self.object_ever_lifted,
+                prev_hand_distance=self.prev_hand_box_distance,
+                prev_goal_distance=self.prev_box_goal_distance,
+                prev_lift_fraction=self.prev_box_lift_fraction,
+                cfg=self.carry_box_cfg,
             )
-            hand_distance = hand_distance_each.mean(dim=-1)
-            bilateral_contact = torch.all(self.hand_box_contact, dim=-1)
-            box_goal_distance = torch.linalg.vector_norm(self.object_goal_pos - self.object_pos, dim=-1)
-            lift_height = self.object_pos[:, 2] - self.object_goal_pos[:, 2]
-            lifted = lift_height > float(self.carry_box_cfg.lift_height)
-            self.object_ever_lifted |= lifted & bilateral_contact & valid.bool()
-            transport_active = lifted & bilateral_contact & valid.bool()
-
-            aux["carry_approach"] = torch.exp(-hand_distance / float(self.carry_box_cfg.approach_sigma)) * valid
-            aux["carry_approach_progress"] = torch.clamp(
-                (self.prev_hand_box_distance - hand_distance) / 0.05, min=-1.0, max=1.0
-            ) * valid
-            aux["carry_pick"] = torch.clamp(
-                lift_height / max(float(self.carry_box_cfg.lift_height), 1.0e-6), min=0.0, max=1.0
-            ) * bilateral_contact.float() * valid
-            aux["carry_transport_progress"] = torch.clamp(
-                (self.prev_box_goal_distance - box_goal_distance) / 0.05, min=-1.0, max=1.0
-            ) * transport_active.float()
-            placed = (
-                self.object_ever_lifted
-                & (box_goal_distance < float(self.carry_box_cfg.goal_tolerance))
-                & (torch.abs(lift_height) < float(self.carry_box_cfg.place_height_tolerance))
-                & (torch.linalg.vector_norm(self.object_lin_vel, dim=-1) < 0.5)
-            )
-            aux["carry_success"] = placed.float() * valid
-            linear_excess = torch.relu(
-                torch.linalg.vector_norm(self.object_lin_vel, dim=-1) - float(self.carry_box_cfg.linear_speed_limit)
-            )
-            angular_excess = torch.relu(
-                torch.linalg.vector_norm(self.object_ang_vel, dim=-1) - float(self.carry_box_cfg.angular_speed_limit)
-            )
-            aux["box_overspeed_penalty"] = (linear_excess.square() + 0.1 * angular_excess.square()) * valid
-            self.prev_hand_box_distance.copy_(hand_distance)
-            self.prev_box_goal_distance.copy_(box_goal_distance)
+            aux.update(carry_aux)
+            self.object_ever_lifted.copy_(carry_state["ever_lifted"])
+            self.prev_hand_box_distance.copy_(carry_state["hand_distance"])
+            self.prev_box_goal_distance.copy_(carry_state["goal_distance"])
+            self.prev_box_lift_fraction.copy_(carry_state["lift_fraction"])
 
         reward = torch.zeros(self.num_envs, device=self.device)
         for name, scale in self.reward_scales.items():
@@ -1162,6 +1395,8 @@ class HumanoidVerseMjlabCore:
         mjlab_actions = self._mjlab_action_input()
         _, _, terminated, time_outs, _ = self.mjlab_env.step(mjlab_actions)
         self._refresh_state()
+        self._advance_carry_observation_history()
+        self._assert_carry_physics_sane("post_step")
         reward, aux = self._compute_reward()
         reset = torch.logical_or(terminated.bool(), time_outs.bool())
         self.reset_buf = reset
@@ -1190,6 +1425,37 @@ class HumanoidVerseMjlabCore:
         env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
         self.reset_idx(env_ids, target_states=target_states)
         return None, {}
+
+    def set_carry_target_world(
+        self,
+        goal_pos: torch.Tensor | np.ndarray | list[float],
+        env_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Set a deployable world-frame carry target without exposing it as actor state."""
+
+        if not self.carry_box_enabled:
+            raise RuntimeError("set_carry_target_world requires carry_box.enabled=True")
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+        else:
+            env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device).reshape(-1)
+        target = torch.as_tensor(goal_pos, dtype=torch.float32, device=self.device)
+        if target.ndim == 1:
+            if target.shape[0] != 3:
+                raise ValueError(f"Expected target xyz, got shape={tuple(target.shape)}")
+            target = target.unsqueeze(0).expand(len(env_ids), -1)
+        if target.shape != (len(env_ids), 3):
+            raise ValueError(f"Expected carry targets [{len(env_ids)}, 3], got {tuple(target.shape)}")
+        self.object_goal_pos[env_ids] = target
+        target_pose_wxyz = torch.cat(
+            [
+                target,
+                torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(len(env_ids), 1),
+            ],
+            dim=-1,
+        )
+        self.carry_target.write_mocap_pose_to_sim(target_pose_wxyz, env_ids=env_ids)
+        self.mjlab_env.scene.write_data_to_sim()
 
     def reset_idx(self, env_ids: torch.Tensor, target_states: dict[str, torch.Tensor] | None = None) -> None:
         if len(env_ids) == 0:
@@ -1285,7 +1551,11 @@ class HumanoidVerseMjlabCore:
                 object_state_xyzw = object_state_xyzw.clone()
                 object_goal_pos = object_goal_pos.clone()
                 parked = self.env_origins[env_ids][invalid].clone()
-                parked[:, 2] -= float(self.carry_box_cfg.park_depth)
+                parked += torch.tensor(
+                    parked_box_local_position(self.carry_box_cfg),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
                 object_state_xyzw[invalid, :3] = parked
                 object_state_xyzw[invalid, 3:7] = torch.tensor(
                     [0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32
@@ -1313,6 +1583,8 @@ class HumanoidVerseMjlabCore:
         self.last_actions[env_ids] = 0.0
         self.history_handler.reset(env_ids)
         self._refresh_state()
+        self._reset_carry_observation_history(env_ids)
+        self._assert_carry_physics_sane("post_reset")
         self._reset_carry_progress(env_ids)
         self.simulator.refresh()
 
@@ -1443,6 +1715,20 @@ class HumanoidVerseMjlabVectorEnv(VectorEnv):
             truncated = truncated.detach().cpu().numpy()
             new_info["aux_rewards"] = {k: v.detach().cpu().numpy() for k, v in new_info["aux_rewards"].items()}
         return observation, reward, terminated, truncated, new_info
+
+    def set_carry_target_world(
+        self,
+        goal_pos: torch.Tensor | np.ndarray | list[float],
+        *,
+        env_ids: torch.Tensor | None = None,
+        to_numpy: bool = True,
+    ):
+        self.base_env.set_carry_target_world(goal_pos, env_ids=env_ids)
+        return self.base_env.get_observation(
+            to_numpy=to_numpy,
+            include_last_action=self.include_last_action,
+            include_history_actor=self.include_history_actor,
+        )
 
     def close(self):
         return self.base_env.close()

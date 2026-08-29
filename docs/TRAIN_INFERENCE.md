@@ -78,10 +78,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 
 `--task carry_box` enables an isolated MJLab task extension with a 0.5 kg
 rigid box and goal marker. If no data argument is supplied, training uses
-`configs/data/lafan_g1_largebox.yaml`: full LaFAN at weight 0.70 and all paired
-G1/large-box trajectories at weight 0.30. The box observation conditions the
-actor, F, critic, and auxiliary critic, but is deliberately excluded from the
-Backward/z encoder and style discriminator.
+`configs/data/lafan_g1_largebox.yaml`: full LaFAN and all paired G1/large-box
+trajectories are balanced at 0.50/0.50. The actor receives only a four-frame
+window of relative box position, 6-D rotation, and size. Current box state is
+excluded from Backward/z; a reserved task-latent tail carries the target. One
+gated temporal discriminator handles walk style and carry robot/box
+synchronization, including robot/box mismatch negatives.
 
 Initialize model weights from the existing locomotion run while starting a new
 optimizer, replay, and step counter:
@@ -182,9 +184,14 @@ uv run python -m humanoidverse.tracking_inference \
   --disable-obs-noise true
 ```
 
+Live tracking shows the policy in its normal colors and a frame-synchronized
+cyan source robot, box, and target 1.5 m to its side. Use
+`--live-reference-offset 0 0 0` for a ghost overlay, or
+`--live-reference false` to restore policy-only playback.
+
 Use `--dataset lafan` with the same checkpoint to exercise the no-box path;
-the 19-D object observation is then exactly zero and the box is parked below
-the scene.
+the four-frame object observation is then exactly zero and the inactive box is
+kept at its collision-safe parking position outside the active scene.
 
 When `--export-onnx` is enabled, `tracking_inference` exports a
 robot-config-aware policy ONNX next to the checkpoint. The policy input split is

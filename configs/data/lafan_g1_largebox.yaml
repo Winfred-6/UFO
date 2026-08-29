@@ -4,10 +4,10 @@ datasets:
   - name: lafan
     format: ufo_pkl
     train_path: humanoidverse/data/lafan_29dof_10s-clipped.pkl
-    weight: 0.70
+    weight: 0.50
 
   - name: g1_largebox
     format: ufo_pkl
-    train_path: humanoidverse/data/g1_largebox_train_near10s_ufo.pkl
-    inference_path: humanoidverse/data/g1_largebox_full_ufo.pkl
-    weight: 0.30
+    train_path: humanoidverse/data/g1_largebox_g1fit_train_near10s_ufo.pkl
+    inference_path: humanoidverse/data/g1_largebox_g1fit_full_ufo.pkl
+    weight: 0.50

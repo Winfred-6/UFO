@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from humanoidverse.agents.envs.carry_box import OBJECT_FRAME_DIM, OBJECT_HISTORY_STEPS, TASK_COMMAND_DIM
 from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig, FBcprAuxAgentTrainConfig
 from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
 from humanoidverse.agents.nn_filters import DictInputFilterConfig
 from humanoidverse.agents.nn_models import (
     ActorArchiConfig,
     BackwardArchiConfig,
+    ConditionalTemporalDiscriminatorArchiConfig,
     DiscriminatorArchiConfig,
     ForwardArchiConfig,
     RewardNormalizerConfig,
@@ -79,6 +81,8 @@ def build_fb_agent(
                 "carry_pick",
                 "carry_transport_progress",
                 "carry_success",
+                "carry_recovery_progress",
+                "carry_drop_penalty",
                 "box_overspeed_penalty",
             ]
         )
@@ -89,6 +93,8 @@ def build_fb_agent(
                 "carry_pick": 1.0,
                 "carry_transport_progress": 2.0,
                 "carry_success": 5.0,
+                "carry_recovery_progress": 1.0,
+                "carry_drop_penalty": -1.0,
                 "box_overspeed_penalty": -0.05,
             }
         )
@@ -104,6 +110,11 @@ def build_fb_agent(
         model=FBcprAuxModelConfig(
             name="FBcprAuxModel",
             device=device,
+            task_latent_key="task_command" if carry_box else None,
+            task_latent_dim=TASK_COMMAND_DIM if carry_box else 0,
+            # task_command is normalized by the environment; this restores
+            # target offsets to metres in the reserved z tail.
+            task_latent_scale=5.0 if carry_box else 1.0,
             archi=FBcprAuxModelArchiConfig(
                 name="FBcprAuxModelArchiConfig",
                 z_dim=256,
@@ -147,11 +158,24 @@ def build_fb_agent(
                         name="DictInputFilterConfig", key=forward_keys
                     ),
                 ),
-                discriminator=DiscriminatorArchiConfig(
-                    name="DiscriminatorArchi",
-                    hidden_dim=1024,
-                    hidden_layers=3,
-                    input_filter=DictInputFilterConfig(name="DictInputFilterConfig", key=["state", "privileged_state"]),
+                discriminator=(
+                    ConditionalTemporalDiscriminatorArchiConfig(
+                        name="ConditionalTemporalDiscriminatorArchi",
+                        hidden_dim=1024,
+                        hidden_layers=3,
+                        history_steps=4,
+                        object_history_steps=OBJECT_HISTORY_STEPS,
+                        object_frame_dim=OBJECT_FRAME_DIM,
+                    )
+                    if carry_box
+                    else DiscriminatorArchiConfig(
+                        name="DiscriminatorArchi",
+                        hidden_dim=1024,
+                        hidden_layers=3,
+                        input_filter=DictInputFilterConfig(
+                            name="DictInputFilterConfig", key=["state", "privileged_state"]
+                        ),
+                    )
                 ),
                 aux_critic=ForwardArchiConfig(
                     name="ForwardArchi",
@@ -175,6 +199,11 @@ def build_fb_agent(
                     "history_actor": BatchNormNormalizerConfig(name="BatchNormNormalizerConfig", momentum=0.01),
                     **(
                         {"object_obs": IdentityNormalizerConfig(name="IdentityNormalizerConfig")}
+                        if carry_box
+                        else {}
+                    ),
+                    **(
+                        {"task_command": IdentityNormalizerConfig(name="IdentityNormalizerConfig")}
                         if carry_box
                         else {}
                     ),
@@ -219,6 +248,8 @@ def build_fb_agent(
             relabel_ratio=0.8,
             grad_penalty_discriminator=10.0,
             weight_decay_discriminator=0.0,
+            balanced_object_discriminator=carry_box,
+            discriminator_mismatch_coef=0.5 if carry_box else 0.0,
             lr_aux_critic=0.0003 * lr_scale,
             reg_coeff_aux=0.02,
             aux_critic_pessimism_penalty=0.5,

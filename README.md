@@ -154,11 +154,14 @@ TeCH was previously exposed as TLDR in early UFO versions. `--agent tldr` is kep
 
 The isolated `--task carry_box` extension adds a visualized 0.5 kg rigid box
 and goal marker without changing the default `task=motion` environment. With
-no explicit data argument it mixes full LaFAN (0.70) with all 174 paired
-G1/large-box trajectories (0.30). Object state conditions the actor, F, critic,
-and auxiliary critic, while the Backward/z encoder and style discriminator
-remain robot-only. The processed carry-box PKLs and mesh are included in the
-repository, so this profile does not depend on a machine-local source folder.
+no explicit data argument it balances full LaFAN and all 174 paired
+G1/large-box trajectories at 0.50/0.50. The deployable actor input is a
+four-frame window of box-relative position, 6-D rotation, and size. A single
+gated temporal discriminator judges robot style in walk mode and joint
+robot/box synchronization in carry mode; the Backward encoder still excludes
+current box state. Target position is carried by a reserved reward/task-latent
+tail, enabling pick, transport, place, and drop recovery without privileged
+actor flags. The processed PKLs and mesh remain self-contained in this repo.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \

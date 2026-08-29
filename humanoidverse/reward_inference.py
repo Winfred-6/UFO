@@ -8,9 +8,32 @@ robots currently support root/locomotion reward tasks only.
 from __future__ import annotations
 
 import os
+import sys
 
-os.environ.setdefault("MUJOCO_GL", "egl")
-os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+def _early_cli_bool(name: str, default: bool) -> bool:
+    """Read a boolean CLI option before importing MuJoCo-dependent modules."""
+
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return default
+    if index + 1 >= len(sys.argv) or sys.argv[index + 1].startswith("--"):
+        return True
+    value = sys.argv[index + 1].strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+# EGL is appropriate for headless/video rendering, but a native MuJoCo window
+# must retain the desktop GL backend. This has to be selected before importing
+# MJLab/MuJoCo.
+if _early_cli_bool("--headless", True) or _early_cli_bool("--save-mp4", False):
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
@@ -18,6 +41,7 @@ import json
 import re
 import time
 from pathlib import Path
+from typing import Any, Callable
 
 import joblib
 import mediapy as media
@@ -39,7 +63,7 @@ from humanoidverse.mjlab_inference_utils import (
     write_g1_mjlab_relabel_xml,
     write_mjlab_relabel_xml,
 )
-from humanoidverse.mjlab_reward_relabel import RewardWrapperHV
+from humanoidverse.mjlab_reward_relabel import CARRY_REWARD_COMPONENTS, RewardWrapperHV
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx
 from humanoidverse.utils.robot_spec import load_robot_training_spec
 
@@ -85,6 +109,57 @@ DEFAULT_TASKS = [
 ]
 
 NON_G1_LOCOMOTION_TASKS = [task for task in DEFAULT_TASKS if task.startswith("move-ego-") or task.startswith("rotate-z-")]
+
+
+class _RewardViewerEnv:
+    """Expose UFO reward rollouts through MJLab's native viewer protocol."""
+
+    def __init__(self, wrapped_env: Any, reset_fn: Callable[[], Any]) -> None:
+        self._wrapped_env = wrapped_env
+        self._reset_fn = reset_fn
+        self.num_envs = wrapped_env.num_envs
+
+    @property
+    def device(self) -> str:
+        return str(self._wrapped_env.device)
+
+    @property
+    def cfg(self) -> Any:
+        return self.unwrapped.cfg
+
+    @property
+    def unwrapped(self) -> Any:
+        return self._wrapped_env.base_env.mjlab_env
+
+    def get_observations(self) -> Any:
+        return self._wrapped_env.base_env.get_observation(
+            to_numpy=False,
+            include_last_action=self._wrapped_env.include_last_action,
+            include_history_actor=self._wrapped_env.include_history_actor,
+        )
+
+    def step(self, actions: torch.Tensor) -> Any:
+        return self._wrapped_env.step(actions, to_numpy=False)
+
+    def reset(self) -> Any:
+        return self._reset_fn()
+
+    def close(self) -> None:
+        self._wrapped_env.close()
+
+
+class _RewardViewerPolicy:
+    """Run a fixed reward/task latent in the native MJLab viewer."""
+
+    def __init__(self, model: torch.nn.Module, z: torch.Tensor) -> None:
+        self._model = model
+        self._z = z
+
+    def __call__(self, observation: Any) -> torch.Tensor:
+        return self._model.act(observation, self._z, mean=True)
+
+    def reset(self) -> None:
+        return None
 
 
 def _is_g1_reward_robot(robot_training) -> bool:
@@ -141,10 +216,21 @@ def _default_standing_target_states(wrapped_env, device: str) -> dict[str, torch
 
     dof_state = torch.zeros((num_envs, core_env.num_dof, 2), device=env_device, dtype=torch.float32)
     dof_state[..., 0] = core_env.default_dof_pos.to(device=env_device, dtype=torch.float32)
-    return {
+    target_states = {
         "root_states": root_state_xyzw.to(device=device, dtype=torch.float32),
         "dof_states": dof_state.to(device=device, dtype=torch.float32),
     }
+    if bool(getattr(core_env, "carry_box_enabled", False)):
+        object_states = torch.zeros((num_envs, 13), device=device, dtype=torch.float32)
+        object_states[:, 6] = 1.0  # identity xyzw
+        target_states.update(
+            {
+                "object_states": object_states,
+                "object_valid": torch.zeros((num_envs, 1), device=device, dtype=torch.float32),
+                "object_goal_pos": torch.zeros((num_envs, 3), device=device, dtype=torch.float32),
+            }
+        )
+    return target_states
 
 
 def _load_replay_buffer(
@@ -224,6 +310,7 @@ def run_reward_inference(
     fps: int,
     max_episode_length_s: float,
     export_onnx: bool,
+    carry_target: list[float] | None,
 ) -> None:
     model_folder = model_folder.expanduser().resolve()
     checkpoint_dir = model_folder / "checkpoint"
@@ -238,12 +325,16 @@ def run_reward_inference(
     control_joint_names = list(robot_training.robot.control_joint_names)
     num_dof = len(control_joint_names)
     is_g1 = _is_g1_reward_robot(robot_training)
+    requested_tasks = tasks
     tasks, task_support_mode = _resolve_reward_tasks(tasks, robot_training)
 
     model_load_device = checkpoint_load_device(device)
     model = load_model_from_checkpoint_dir(checkpoint_dir, device=model_load_device)
     model.to(device)
     model.eval()
+    if requested_tasks is None and int(getattr(model.cfg, "task_latent_dim", 0)) > 0:
+        tasks = [*tasks, *CARRY_REWARD_COMPONENTS.keys()]
+        task_support_mode += " + carry reward/task latent"
 
     if export_onnx:
         _export_model(model, model_folder / "exported")
@@ -319,7 +410,8 @@ def run_reward_inference(
     wrapped_env, _ = env_cfg.build(num_envs=1)
     renderer = None
     try:
-        print(f"[INFO] Generating rollout videos with XML={env_cfg.mjcf_path}")
+        rollout_mode = "videos" if save_mp4 else ("native MJLab viewer" if not headless else "headless")
+        print(f"[INFO] Running {rollout_mode} reward rollouts with XML={env_cfg.mjcf_path}")
         if save_mp4:
             renderer = MujocoQposRenderer(
                 robot_xml,
@@ -333,9 +425,48 @@ def run_reward_inference(
             frames = []
             for z_cpu in z_dict[task]:
                 z = z_cpu.to(device).repeat(1, 1)
-                target_states = _default_standing_target_states(wrapped_env, device=device)
-                observation, _info = wrapped_env.reset(to_numpy=False, target_states=target_states)
-                print("[INFO] Reset reward rollout to default standing pose.")
+                if task in CARRY_REWARD_COMPONENTS:
+                    if not wrapped_env._env._motion_lib.all_motions_loaded:
+                        wrapped_env._env._motion_lib.load_all_motions()
+
+                    def reset_rollout():
+                        for _ in range(64):
+                            reset_observation, reset_info = wrapped_env.reset(to_numpy=False)
+                            if bool(torch.any(reset_observation["object_obs"].abs() > 1.0e-6).item()):
+                                break
+                        else:
+                            raise RuntimeError("Could not reset a box-bearing motion for carry reward rollout")
+                        if carry_target is not None:
+                            reset_observation = wrapped_env.set_carry_target_world(carry_target, to_numpy=False)
+                        return reset_observation, reset_info
+
+                    observation, _info = reset_rollout()
+                    if carry_target is not None:
+                        print(f"[INFO] Carry target overridden in world frame: {carry_target}")
+                    print("[INFO] Reset carry reward rollout with a persistent box task gate.")
+                else:
+                    target_states = _default_standing_target_states(wrapped_env, device=device)
+
+                    def reset_rollout():
+                        return wrapped_env.reset(to_numpy=False, target_states=target_states)
+
+                    observation, _info = reset_rollout()
+                    print("[INFO] Reset reward rollout to default standing pose with box gate disabled.")
+
+                if not headless and not save_mp4:
+                    from mjlab.viewer import NativeMujocoViewer
+
+                    print(
+                        f"[INFO] Opening MJLab native viewer for task={task}, steps={episode_length}",
+                        flush=True,
+                    )
+                    viewer_env = _RewardViewerEnv(wrapped_env, reset_rollout)
+                    viewer_policy = _RewardViewerPolicy(model, z)
+                    NativeMujocoViewer(viewer_env, viewer_policy, frame_rate=float(fps)).run(
+                        num_steps=int(episode_length)
+                    )
+                    continue
+
                 use_env_render = True
                 if save_mp4:
                     frame, use_env_render = render_policy_frame(wrapped_env, renderer, use_env_render=use_env_render)
@@ -384,6 +515,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-elevation", type=float, default=-18.0)
     parser.add_argument("--fps", type=int, default=50)
     parser.add_argument("--max-episode-length-s", type=float, default=10000.0)
+    parser.add_argument(
+        "--carry-target",
+        nargs=3,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="Optional world-frame target xyz for carry reward rollouts; encoded only through task z.",
+    )
     add_bool_arg(parser, "--export-onnx", False, "Export ONNX next to the checkpoint before inference.")
     return resolve_inference_data_and_robot_args(parser.parse_args(), parser)
 
@@ -415,6 +554,7 @@ def main() -> None:
         fps=args.fps,
         max_episode_length_s=args.max_episode_length_s,
         export_onnx=args.export_onnx,
+        carry_target=args.carry_target,
     )
 
 

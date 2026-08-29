@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 
-
 REQUIRED_MOTION_FIELDS = ("root_trans_offset", "pose_aa", "fps")
 OBJECT_TIME_SERIES_FIELDS = {
     "object_pos": 3,
@@ -17,6 +16,11 @@ OBJECT_TIME_SERIES_FIELDS = {
     "object_ang_vel": 3,
     "object_valid": 1,
     "object_goal_pos": 3,
+}
+OPTIONAL_OBJECT_TIME_SERIES_FIELDS = {
+    "object_reset_valid": 1,
+    "object_stage_reset_valid": 1,
+    "object_phase": 1,
 }
 
 
@@ -94,6 +98,16 @@ def validate_ufo_motion_dict(data: dict[str, dict[str, Any]] | Mapping[str, Mapp
                 )
             if not np.all(np.isfinite(value)):
                 _fail(source_name, motion_key, f"{field} contains non-finite values")
+        for field, width in OPTIONAL_OBJECT_TIME_SERIES_FIELDS.items():
+            if field not in motion:
+                continue
+            if "object_valid" not in motion:
+                _fail(source_name, motion_key, f"{field} requires a complete object trajectory")
+            value = np.asarray(motion[field])
+            if value.shape != (root_trans_offset.shape[0], width):
+                _fail(source_name, motion_key, f"{field} must have shape [T, {width}], got {value.shape}")
+            if not np.all(np.isfinite(value)):
+                _fail(source_name, motion_key, f"{field} contains non-finite values")
         if "object_quat" in motion:
             quat_norm = np.linalg.norm(np.asarray(motion["object_quat"]), axis=1)
             if np.any(np.abs(quat_norm - 1.0) > 1.0e-3):
@@ -102,6 +116,18 @@ def validate_ufo_motion_dict(data: dict[str, dict[str, Any]] | Mapping[str, Mapp
             valid = np.asarray(motion["object_valid"])
             if np.any((valid < 0.0) | (valid > 1.0)):
                 _fail(source_name, motion_key, "object_valid values must be in [0, 1]")
+        if "object_reset_valid" in motion:
+            reset_valid = np.asarray(motion["object_reset_valid"])
+            if np.any((reset_valid < 0.0) | (reset_valid > 1.0)):
+                _fail(source_name, motion_key, "object_reset_valid values must be in [0, 1]")
+        if "object_stage_reset_valid" in motion:
+            reset_valid = np.asarray(motion["object_stage_reset_valid"])
+            if np.any((reset_valid < 0.0) | (reset_valid > 1.0)):
+                _fail(source_name, motion_key, "object_stage_reset_valid values must be in [0, 1]")
+        if "object_phase" in motion:
+            phase = np.asarray(motion["object_phase"])
+            if np.any(phase != np.round(phase)) or np.any((phase < 0.0) | (phase > 4.0)):
+                _fail(source_name, motion_key, "object_phase values must be integer codes in [0, 4]")
 
         validated[motion_key] = motion
 

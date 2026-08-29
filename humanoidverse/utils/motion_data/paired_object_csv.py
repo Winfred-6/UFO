@@ -12,11 +12,15 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from humanoidverse.utils.motion_data.object_physics import (
+    finite_difference,
+    mesh_axis_aligned_bounds,
+    sanitize_object_ground_trajectory,
+)
 from humanoidverse.utils.motion_data.robot_state import RobotStateMotion
 from humanoidverse.utils.motion_data.robot_state_convert import robot_state_to_ufo_motion
 from humanoidverse.utils.motion_data.schema import validate_ufo_motion_dict
 from humanoidverse.utils.robot_spec import RobotSpec
-
 
 _AUGMENTATION_SUFFIX = re.compile(r"_(?P<kind>rot|trans)_(?P<index>\d+)$")
 
@@ -113,15 +117,6 @@ def _normalize_quaternions(quat_xyzw: np.ndarray, path: Path) -> np.ndarray:
         if float(np.dot(quat[frame - 1], quat[frame])) < 0.0:
             quat[frame] *= -1.0
     return quat
-
-
-def _finite_difference(values: np.ndarray, fps: float) -> np.ndarray:
-    result = np.zeros_like(values, dtype=np.float32)
-    if len(values) <= 1:
-        return result
-    result[:-1] = np.diff(values, axis=0) * float(fps)
-    result[-1] = result[-2]
-    return result
 
 
 def _angular_velocity_world(quat_xyzw: np.ndarray, fps: float) -> np.ndarray:
@@ -221,16 +216,29 @@ def load_paired_hhtools_csv(
             object_quat = _normalize_quaternions(
                 _matrix(object_rows, ["quat_x", "quat_y", "quat_z", "quat_w"], object_path), object_path
             )
-            goal_window = max(1, int(round(0.2 * motion_fps)))
-            goal_pos = np.median(object_pos[-goal_window:], axis=0).astype(np.float32)
+            if mesh_path.exists():
+                collision_center, half_extents = mesh_axis_aligned_bounds(mesh_path)
+                object_pos, object_lin_vel, object_goal_pos, ground_lift = sanitize_object_ground_trajectory(
+                    object_pos,
+                    object_quat,
+                    fps=motion_fps,
+                    collision_center=collision_center,
+                    half_extents=half_extents,
+                )
+            else:
+                object_lin_vel = finite_difference(object_pos, motion_fps)
+                goal_window = max(1, int(round(0.2 * motion_fps)))
+                goal_pos = np.median(object_pos[-goal_window:], axis=0).astype(np.float32)
+                object_goal_pos = np.repeat(goal_pos[None, :], len(object_pos), axis=0)
+                ground_lift = np.zeros(len(object_pos), dtype=np.float32)
             record.update(
                 {
                     "object_pos": object_pos,
                     "object_quat": object_quat,
-                    "object_lin_vel": _finite_difference(object_pos, motion_fps),
+                    "object_lin_vel": object_lin_vel,
                     "object_ang_vel": _angular_velocity_world(object_quat, motion_fps),
                     "object_valid": np.ones((len(object_pos), 1), dtype=np.float32),
-                    "object_goal_pos": np.repeat(goal_pos[None, :], len(object_pos), axis=0),
+                    "object_goal_pos": object_goal_pos,
                     "object_name": str(object_meta.get("object", "largebox")),
                     "object_mesh_path": str(mesh_path.resolve()) if mesh_path.exists() else None,
                     "base_sequence_id": base_sequence_id,
@@ -246,6 +254,10 @@ def load_paired_hhtools_csv(
                     "base_sequence_id": base_sequence_id,
                     "augmentation": augmentation,
                     "augmentation_index": augmentation_index,
+                    "object_ground_projection": {
+                        "applied_frames": int(np.count_nonzero(ground_lift > 0.0)),
+                        "max_lift_m": float(np.max(ground_lift, initial=0.0)),
+                    },
                 }
             )
             record["metadata"] = metadata

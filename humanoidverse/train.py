@@ -147,6 +147,7 @@ def build_ufo_mjlab_config(
     robot_config: str | Path | None = None,
     task: str = "motion",
     init_from: str | Path | None = None,
+    fail_fast_diagnostics: bool = False,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
     carry_box_enabled = task == "carry_box"
@@ -197,6 +198,8 @@ def build_ufo_mjlab_config(
         wandb_project=DEFAULT_WANDB_PROJECT,
     )
     agent_cfg = selected["agent_cfg"]
+    if fail_fast_diagnostics:
+        agent_cfg = agent_cfg.model_copy(update={"fail_fast_diagnostics": True})
     wandb_group = selected["wandb_group"]
     wandb_project = selected["wandb_project"]
     train_runtime = dict(selected["train_runtime"])
@@ -248,7 +251,7 @@ def build_ufo_mjlab_config(
             root_height_obs=True,
             auto_reset=False,
             seed=seed,
-            carry_box=CarryBoxConfig(enabled=carry_box_enabled),
+            carry_box=CarryBoxConfig(enabled=carry_box_enabled, fail_fast_diagnostics=fail_fast_diagnostics),
         ),
         work_dir=work_dir,
         init_from=str(Path(init_from).expanduser().resolve()) if init_from is not None else None,
@@ -292,6 +295,8 @@ def build_ufo_mjlab_config(
         distributed_sync=distributed_sync,
         distributed_global_steps=True,
         distributed_average_metrics=True,
+        nonfinite_check_model_every_updates=0,
+        nonfinite_check_rollout_every_local_steps=num_envs if fail_fast_diagnostics else 0,
         tags={
             "backend": "mjlab",
             "agent": agent,
@@ -382,6 +387,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         robot_config=args.robot_config,
         task=args.task,
         init_from=args.init_from,
+        fail_fast_diagnostics=bool(args.fail_fast_diagnostics),
     )
     print(
         "[INFO] UFO train: "
@@ -396,7 +402,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         f"cartwheel_aux_safe={args.cartwheel_aux_safe}, lr_scale={args.lr_scale}, clip_grad_norm={args.clip_grad_norm}, "
         f"disable_dr={cfg.env.disable_domain_randomization}, disable_obs_noise={cfg.env.disable_obs_noise}, "
         f"init_from={cfg.init_from}, carry_box_mass_kg={cfg.env.carry_box.mass_kg if cfg.env.carry_box.enabled else None}, "
-        f"compile={cfg.agent.compile}",
+        f"fail_fast_diagnostics={args.fail_fast_diagnostics}, compile={cfg.agent.compile}",
         flush=True,
     )
     try:
@@ -579,6 +585,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-dr", action="store_true", help="Disable domain randomization for training.")
     parser.add_argument("--disable-obs-noise", action="store_true", help="Disable observation noise for training.")
+    parser.add_argument(
+        "--fail-fast-diagnostics",
+        action="store_true",
+        help="Stop at the first corrupt carry physics state or raw update tensor and print its provenance; never repairs or skips data.",
+    )
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Scale FB learning rates. TeCH preset ignores this value.")
     parser.add_argument("--clip-grad-norm", type=float, default=0.0, help="Enable FB actor/FB gradient clipping when > 0.")
     parser.add_argument(

@@ -142,13 +142,14 @@ TeCH 在早期 UFO 版本中曾经叫 TLDR。`--agent tldr` 仍然保留为 `--a
 
 `--task carry_box` 是独立开关，不会改变原来的 `task=motion` 环境。未指定
 数据参数时会自动使用 `configs/data/lafan_g1_largebox.yaml`：完整 LaFAN
-权重 0.70，仓库内处理好的 174 条 G1/箱子配对轨迹权重 0.30，不再依赖
+与仓库内处理好的 174 条 G1/箱子配对轨迹按 0.50/0.50 均衡采样，不再依赖
 本机 Downloads 路径。箱子是 MJLab 中的 500 g 自由刚体，并带有可视化
 目标框。
 
-箱子观测只进入 actor、F、主 critic 和 aux critic；Backward/z 编码器与
-风格 discriminator 仍只看机器人状态。旧 locomotion checkpoint 仅迁移
-模型权重，新 run 的优化器、replay 和计数器从零开始：
+actor 只接收箱子相对位置、6D 旋转、尺寸的 4 帧窗口；当前箱子状态仍不进入
+Backward/z 编码器。单个门控时序 discriminator 在 walk 模式只判机器人，
+在 carry 模式联合判别人箱同步，并使用错配箱子负样本。目标位置写入 reward/task
+z 的保留尾部，支持拾取、搬运、放置与掉落重捡而不向 actor 暴露接触标志。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \

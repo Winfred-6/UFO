@@ -33,7 +33,6 @@ from humanoidverse.utils.helpers import export_meta_policy_as_onnx, get_backward
 from humanoidverse.utils.motion_data import prepare_manifest_dataset_path, prepare_manifest_robot_config_path
 from humanoidverse.utils.robot_spec import assert_robot_configs_compatible, load_robot_training_spec, resolve_robot_config_path
 
-
 DEFAULT_ROBOT_CONFIG = "configs/robots/g1_29dof.yaml"
 
 
@@ -90,6 +89,175 @@ class _TrackingViewerPolicy:
 
     def reset(self) -> None:
         self._step = 0
+
+    @property
+    def reference_frame(self) -> int:
+        """Reference frame matching the state produced by the latest action."""
+
+        return self._step
+
+
+def _numpy_reference_dict(obs_dict: dict[str, torch.Tensor]) -> dict[str, np.ndarray]:
+    """Detach reference fields once before entering the interactive viewer loop."""
+
+    result: dict[str, np.ndarray] = {}
+    for key in ("object_pos", "object_quat", "object_valid", "object_goal_pos"):
+        value = obs_dict.get(key)
+        if value is not None:
+            result[key] = np.asarray(value.detach().cpu().numpy())
+    return result
+
+
+def _scene_entity_or_none(scene: Any, name: str) -> Any | None:
+    try:
+        return scene[name]
+    except KeyError:
+        return None
+
+
+def _index_array(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.int64).reshape(-1)
+
+
+def _apply_reference_frame_to_mjdata(
+    data: Any,
+    scene: Any,
+    expert_qpos: np.ndarray,
+    reference: dict[str, np.ndarray],
+    frame: int,
+    position_offset: np.ndarray,
+) -> int:
+    """Write one source-motion frame into a full MJLab scene ``MjData``.
+
+    ``data`` is initialized from the policy scene by the caller, so entities
+    which are not part of the tracking target retain a valid pose.  Robot and
+    active carry-box states are then replaced with the synchronized source
+    motion and translated together for side-by-side viewing.
+    """
+
+    expert_qpos = np.asarray(expert_qpos, dtype=np.float64)
+    if expert_qpos.ndim != 2 or expert_qpos.shape[0] == 0:
+        raise ValueError(f"Expected non-empty expert qpos [T, nq], got {expert_qpos.shape}")
+    frame = min(max(int(frame), 0), expert_qpos.shape[0] - 1)
+    offset = np.asarray(position_offset, dtype=np.float64).reshape(-1)
+    if offset.shape != (3,):
+        raise ValueError(f"Expected live reference offset xyz, got shape={offset.shape}")
+
+    robot = scene["robot"]
+    root_q_adr = _index_array(robot.indexing.free_joint_q_adr)
+    joint_q_adr = _index_array(robot.indexing.joint_q_adr)
+    if root_q_adr.size != 7:
+        raise ValueError(f"Expected robot free-joint qpos width 7, got {root_q_adr.size}")
+    if expert_qpos.shape[1] != 7 + joint_q_adr.size:
+        raise ValueError(
+            f"Reference qpos does not match the MJLab robot entity: reference={expert_qpos.shape[1]}, expected={7 + joint_q_adr.size}"
+        )
+    data.qpos[root_q_adr] = expert_qpos[frame, :7]
+    data.qpos[root_q_adr[:3]] += offset
+    data.qpos[joint_q_adr] = expert_qpos[frame, 7:]
+
+    carry_box = _scene_entity_or_none(scene, "carry_box")
+    carry_target = _scene_entity_or_none(scene, "carry_target")
+    object_valid = reference.get("object_valid")
+    has_object = object_valid is not None and float(np.asarray(object_valid[frame]).reshape(-1)[0]) > 0.5
+    if carry_box is not None:
+        object_q_adr = _index_array(carry_box.indexing.free_joint_q_adr)
+        if object_q_adr.size != 7:
+            raise ValueError(f"Expected carry-box free-joint qpos width 7, got {object_q_adr.size}")
+        if has_object:
+            object_pos = np.asarray(reference["object_pos"][frame], dtype=np.float64).reshape(3)
+            object_quat_xyzw = np.asarray(reference["object_quat"][frame], dtype=np.float64).reshape(4)
+            data.qpos[object_q_adr[:3]] = object_pos + offset
+            data.qpos[object_q_adr[3:7]] = np.roll(object_quat_xyzw, 1)
+        else:
+            # Inactive objects were copied from the policy scene's collision-safe
+            # parking pose.  Keep the reference copy parked as well.
+            data.qpos[object_q_adr[:3]] += offset
+
+    if carry_target is not None and carry_target.indexing.mocap_id is not None:
+        mocap_id = int(carry_target.indexing.mocap_id)
+        if has_object:
+            goal_pos = np.asarray(reference["object_goal_pos"][frame], dtype=np.float64).reshape(3)
+            data.mocap_pos[mocap_id] = goal_pos + offset
+            data.mocap_quat[mocap_id] = np.asarray([1.0, 0.0, 0.0, 0.0])
+        else:
+            data.mocap_pos[mocap_id] += offset
+    return frame
+
+
+def _make_tracking_comparison_viewer(
+    viewer_env: _TrackingViewerEnv,
+    viewer_policy: _TrackingViewerPolicy,
+    *,
+    expert_qpos: np.ndarray,
+    obs_dict: dict[str, torch.Tensor],
+    frame_rate: float,
+    reference_offset: tuple[float, float, float],
+) -> Any:
+    """Create a native viewer that adds the source motion as tinted scene geoms."""
+
+    import mujoco
+    from mjlab.viewer import NativeMujocoViewer
+
+    reference = _numpy_reference_dict(obs_dict)
+    offset = np.asarray(reference_offset, dtype=np.float64)
+
+    class _TrackingComparisonViewer(NativeMujocoViewer):
+        def __init__(self) -> None:
+            super().__init__(viewer_env, viewer_policy, frame_rate=frame_rate)
+            self._reference_data = None
+            self._reference_vopt = None
+            self._reference_pert = None
+
+        def setup(self) -> None:
+            super().setup()
+            assert self.mjm is not None
+            self._reference_data = mujoco.MjData(self.mjm)
+            self._reference_vopt = mujoco.MjvOption()
+            self._reference_pert = mujoco.MjvPerturb()
+
+        def _update_debug_visualizers(self, viewer: Any) -> None:
+            super()._update_debug_visualizers(viewer)
+            assert self.mjm is not None and self.mjd is not None
+            assert self._reference_data is not None
+            assert self._reference_vopt is not None and self._reference_pert is not None
+
+            reference_data = self._reference_data
+            reference_data.qpos[:] = self.mjd.qpos
+            reference_data.qvel[:] = 0.0
+            if self.mjm.nmocap:
+                reference_data.mocap_pos[:] = self.mjd.mocap_pos
+                reference_data.mocap_quat[:] = self.mjd.mocap_quat
+            _apply_reference_frame_to_mjdata(
+                reference_data,
+                viewer_env.unwrapped.scene,
+                expert_qpos,
+                reference,
+                viewer_policy.reference_frame,
+                offset,
+            )
+            mujoco.mj_forward(self.mjm, reference_data)
+
+            first_reference_geom = int(viewer.user_scn.ngeom)
+            mujoco.mjv_addGeoms(
+                self.mjm,
+                reference_data,
+                self._reference_vopt,
+                self._reference_pert,
+                mujoco.mjtCatBit.mjCAT_DYNAMIC.value,
+                viewer.user_scn,
+            )
+            # Cyan tint makes the source motion unambiguous while preserving
+            # the policy model's original colors and the box mesh silhouette.
+            tint = np.asarray([0.05, 0.85, 1.0], dtype=np.float32)
+            for geom_id in range(first_reference_geom, int(viewer.user_scn.ngeom)):
+                geom = viewer.user_scn.geoms[geom_id]
+                geom.rgba[:3] = 0.35 * geom.rgba[:3] + 0.65 * tint
+                geom.rgba[3] = min(float(geom.rgba[3]), 0.78)
+
+    return _TrackingComparisonViewer()
 
 
 def _resize_nearest(frame: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -225,6 +393,26 @@ def _resolve_tracking_robot_config(
     return resolve_robot_config_path(DEFAULT_ROBOT_CONFIG)
 
 
+def _prepare_tracking_playback_env_cfg(env_cfg: Any) -> tuple[Any, bool]:
+    """Disable the training-only staged reset sampler for exact playback.
+
+    Tracking inference resets to the explicitly selected source trajectory and
+    then advances through it frame by frame.  Requiring every inference PKL to
+    carry staged random-reset certification would prevent older checkpoints
+    and full-resolution source data from being inspected, even though that
+    sampler is never used by the tracking rollout.  Keep the legacy certified
+    reset mask enabled for the environment's initial construction reset.
+    """
+
+    carry_box = getattr(env_cfg, "carry_box", None)
+    if not bool(getattr(carry_box, "enabled", False)) or not bool(
+        getattr(carry_box, "stage_reset_curriculum", False)
+    ):
+        return env_cfg, False
+    playback_carry_box = carry_box.model_copy(update={"stage_reset_curriculum": False})
+    return env_cfg.model_copy(update={"carry_box": playback_carry_box}), True
+
+
 def run_tracking_inference(
     *,
     model_folder: Path,
@@ -245,6 +433,8 @@ def run_tracking_inference(
     log_every_steps: int,
     max_episode_length_s: float,
     export_onnx: bool,
+    live_reference: bool = True,
+    live_reference_offset: tuple[float, float, float] = (0.0, 1.5, 0.0),
 ) -> None:
     model_folder = model_folder.expanduser().resolve()
     checkpoint_dir = model_folder / "checkpoint"
@@ -278,6 +468,13 @@ def run_tracking_inference(
         disable_obs_noise=disable_obs_noise,
         max_episode_length_s=max_episode_length_s,
     )
+    env_cfg, disabled_staged_reset = _prepare_tracking_playback_env_cfg(env_cfg)
+    if disabled_staged_reset:
+        print(
+            "[INFO] Tracking playback uses the source sequence directly; "
+            "disabled the training-only staged reset curriculum.",
+            flush=True,
+        )
     wrapped_env, _ = env_cfg.build(num_envs=1)
     env = wrapped_env._env
 
@@ -319,20 +516,37 @@ def run_tracking_inference(
             if max_steps is not None:
                 episode_len = min(episode_len, int(max_steps))
 
-            if not headless and not save_mp4:
-                from mjlab.viewer import NativeMujocoViewer
-
-                print(f"[INFO] Opening MJLab native viewer for motion_id={motion_id}, steps={episode_len}", flush=True)
-                viewer_env = _TrackingViewerEnv(wrapped_env, target_states)
-                viewer_policy = _TrackingViewerPolicy(model, z)
-                NativeMujocoViewer(viewer_env, viewer_policy, frame_rate=float(fps)).run(num_steps=episode_len)
-                continue
-
             expert_qpos = _expert_qpos_from_obs(
                 obs_dict,
                 num_dof=num_dof,
                 dof_qpos_order_indices=dof_qpos_order_indices,
             )
+
+            if not headless and not save_mp4:
+                print(f"[INFO] Opening MJLab native viewer for motion_id={motion_id}, steps={episode_len}", flush=True)
+                viewer_env = _TrackingViewerEnv(wrapped_env, target_states)
+                viewer_policy = _TrackingViewerPolicy(model, z)
+                if live_reference:
+                    print(
+                        "[INFO] Live comparison: policy=original colors, source motion=cyan, "
+                        f"source_offset_xyz={tuple(float(value) for value in live_reference_offset)}",
+                        flush=True,
+                    )
+                    viewer = _make_tracking_comparison_viewer(
+                        viewer_env,
+                        viewer_policy,
+                        expert_qpos=expert_qpos,
+                        obs_dict=obs_dict,
+                        frame_rate=float(fps),
+                        reference_offset=live_reference_offset,
+                    )
+                else:
+                    from mjlab.viewer import NativeMujocoViewer
+
+                    viewer = NativeMujocoViewer(viewer_env, viewer_policy, frame_rate=float(fps))
+                viewer.run(num_steps=episode_len)
+                continue
+
             frames: list[np.ndarray] = []
             use_env_render = True
 
@@ -389,8 +603,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-azimuth", type=float, default=135.0)
     parser.add_argument("--camera-elevation", type=float, default=-18.0)
     parser.add_argument("--fps", type=int, default=50)
+    add_bool_arg(
+        parser,
+        "--live-reference",
+        True,
+        "Show a synchronized cyan source-motion robot/box next to the policy in the native viewer.",
+    )
+    parser.add_argument(
+        "--live-reference-offset",
+        type=float,
+        nargs=3,
+        default=(0.0, 1.5, 0.0),
+        metavar=("X", "Y", "Z"),
+        help="World-frame xyz offset for the live source motion; use 0 0 0 for a ghost overlay.",
+    )
     parser.add_argument("--max-steps", type=int, default=None, help="Optional cap on rollout/video frames for quick previews.")
-    parser.add_argument("--log-every-steps", type=int, default=100, help="Print rollout/render progress every N steps; 0 disables periodic logs.")
+    parser.add_argument(
+        "--log-every-steps", type=int, default=100, help="Print rollout/render progress every N steps; 0 disables periodic logs."
+    )
     parser.add_argument("--max-episode-length-s", type=float, default=10000.0)
     add_bool_arg(parser, "--export-onnx", True, "Export ONNX next to the checkpoint before inference.")
     args = parser.parse_args()
@@ -434,6 +664,8 @@ def main() -> None:
         log_every_steps=args.log_every_steps,
         max_episode_length_s=args.max_episode_length_s,
         export_onnx=args.export_onnx,
+        live_reference=args.live_reference,
+        live_reference_offset=tuple(args.live_reference_offset),
     )
 
 

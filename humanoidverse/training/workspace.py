@@ -353,8 +353,110 @@ def _copy_with_inserted_features(
     return result
 
 
+def _source_object_observation_dim(model_path: Path) -> int:
+    """Read the source checkpoint's serialized observation shape."""
+
+    candidates = (
+        model_path.parent.parent / "init_kwargs.json",
+        model_path.parent / "init_kwargs.json",
+    )
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        with candidate.open() as file:
+            payload = json.load(file)
+        object_space = payload.get("obs_space", {}).get("spaces", {}).get("object_obs")
+        if object_space is None:
+            return 0
+        shape = object_space.get("shape", [])
+        if len(shape) != 1:
+            raise ValueError(f"Invalid source object_obs shape in {candidate}: {shape}")
+        return int(shape[0])
+    # Older locomotion checkpoints predate object observations.
+    return 0
+
+
+def _copy_replacing_object_features(
+    source: torch.Tensor,
+    destination: torch.Tensor,
+    *,
+    source_object_dim: int,
+    destination_object_dim: int,
+    tail_count: int,
+    zero_new_object: bool,
+    map_legacy_pose: bool,
+    map_legacy_goal_to_task: bool,
+    task_latent_dim: int,
+) -> torch.Tensor | None:
+    """Migrate network inputs while replacing the old object feature block.
+
+    Non-object observation columns and z/action tails are copied exactly.  New
+    object columns start at zero.  For the former 19-D carry format, the nine
+    semantically identical position/rotation columns are retained; obsolete
+    valid/velocity/goal columns are never silently reinterpreted as new data.
+    """
+
+    if source.ndim != destination.ndim:
+        return None
+    expected_delta = destination_object_dim - source_object_dim
+    differing_axes = [
+        axis
+        for axis, (source_size, destination_size) in enumerate(zip(source.shape, destination.shape))
+        if destination_size - source_size == expected_delta
+    ]
+    if len(differing_axes) != 1:
+        return None
+    axis = differing_axes[0]
+    if any(
+        source.shape[other_axis] != destination.shape[other_axis]
+        for other_axis in range(source.ndim)
+        if other_axis != axis
+    ):
+        return None
+    old_width = int(source.shape[axis])
+    new_width = int(destination.shape[axis])
+    prefix_width = old_width - tail_count - source_object_dim
+    if prefix_width < 0 or prefix_width + destination_object_dim + tail_count != new_width:
+        return None
+
+    result = destination.clone()
+
+    def copy_slice(dst_start: int, dst_stop: int, src_start: int, src_stop: int) -> None:
+        destination_slice = [slice(None)] * source.ndim
+        source_slice = [slice(None)] * source.ndim
+        destination_slice[axis] = slice(dst_start, dst_stop)
+        source_slice[axis] = slice(src_start, src_stop)
+        result[tuple(destination_slice)] = source[tuple(source_slice)]
+
+    copy_slice(0, prefix_width, 0, prefix_width)
+    if zero_new_object:
+        object_slice = [slice(None)] * source.ndim
+        object_slice[axis] = slice(prefix_width, prefix_width + destination_object_dim)
+        result[tuple(object_slice)] = 0.0
+    if tail_count:
+        copy_slice(
+            prefix_width + destination_object_dim,
+            new_width,
+            prefix_width + source_object_dim,
+            old_width,
+        )
+
+    # Legacy carry layout: [valid, rel_pos(3), rel_rot6d(6),
+    # rel_lin_vel(3), rel_ang_vel(3), goal_delta(3)].
+    if map_legacy_pose and source_object_dim == 19 and destination_object_dim >= 9:
+        copy_slice(prefix_width, prefix_width + 9, prefix_width + 1, prefix_width + 10)
+    if (
+        map_legacy_goal_to_task
+        and source_object_dim == 19
+        and task_latent_dim == 3
+        and tail_count >= task_latent_dim
+    ):
+        copy_slice(new_width - task_latent_dim, new_width, prefix_width + 16, prefix_width + 19)
+    return result
+
+
 def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
-    """Load a locomotion checkpoint while zero-expanding new object input columns."""
+    """Load compatible weights while explicitly migrating object input columns."""
     model_path = _resolve_init_model_path(init_from)
     source_state = safetensors.torch.load_file(model_path, device="cpu")
     destination_state = agent._model.state_dict()
@@ -363,6 +465,8 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
     if object_dim <= 0:
         raise ValueError("--init-from weight migration is intended for a model with object_obs")
 
+    source_object_dim = _source_object_observation_dim(model_path)
+    task_latent_dim = int(getattr(agent.cfg.model, "task_latent_dim", 0))
     migrated: dict[str, torch.Tensor] = {}
     exact_count = 0
     expanded_count = 0
@@ -386,12 +490,16 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
         else:
             incompatible.append(key)
             continue
-        expanded = _copy_with_inserted_features(
+        expanded = _copy_replacing_object_features(
             source,
             destination,
-            insert_count=object_dim,
+            source_object_dim=source_object_dim,
+            destination_object_dim=object_dim,
             tail_count=tail_count,
-            zero_insert=key.endswith("mlp.1.weight"),
+            zero_new_object=key.endswith("mlp.1.weight"),
+            map_legacy_pose=key.endswith("mlp.1.weight"),
+            map_legacy_goal_to_task=".embed_z.0.mlp." in key and key.endswith("mlp.1.weight"),
+            task_latent_dim=task_latent_dim,
         )
         if expanded is None:
             incompatible.append(key)
@@ -407,7 +515,8 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
         raise RuntimeError(f"Unexpected keys while loading --init-from checkpoint: {unexpected}")
     print(
         "[INFO] Initialized model weights only: "
-        f"source={model_path}, exact_tensors={exact_count}, expanded_object_input_tensors={expanded_count}, "
+        f"source={model_path}, source_object_dim={source_object_dim}, destination_object_dim={object_dim}, "
+        f"exact_tensors={exact_count}, migrated_object_input_tensors={expanded_count}, "
         f"new_tensors={len(missing)}; optimizer/replay/train counters were not loaded",
         flush=True,
     )
@@ -1050,6 +1159,8 @@ class Workspace:
 
                 with profiler.stage("rollout_context", cuda=True):
                     context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
+                    if context is not None:
+                        context = self.agent._model.condition_task_latent(context, obs)
                 if local_time < self.cfg.num_seed_steps:
                     if gpu_native_rollout:
                         action = native_action_low + torch.rand_like(native_action_low) * (native_action_high - native_action_low)
