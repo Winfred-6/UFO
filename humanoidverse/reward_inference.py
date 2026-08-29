@@ -45,11 +45,19 @@ from typing import Any, Callable
 
 import joblib
 import mediapy as media
+import numpy as np
 import torch
 
 from humanoidverse.agents.buffers.torchrl_replay import TorchRLReplayBuffer
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBufferMultiDim
 from humanoidverse.agents.buffers.transition import DictBuffer
+from humanoidverse.agents.envs.carry_box import (
+    CARRY_STAGE_APPROACH,
+    CARRY_STAGE_NAMES,
+    CARRY_STAGE_PICKUP,
+    CARRY_STAGE_PLACE,
+    CARRY_STAGE_TRANSPORT,
+)
 from humanoidverse.agents.load_utils import load_model_from_checkpoint_dir
 from humanoidverse.mjlab_inference_utils import (
     MujocoQposRenderer,
@@ -57,6 +65,7 @@ from humanoidverse.mjlab_inference_utils import (
     add_robot_config_manifest_args,
     checkpoint_load_device,
     load_mjlab_env_cfg,
+    prepare_carry_inference_env_cfg,
     render_policy_frame,
     resolve_inference_data_and_robot_args,
     resolve_inference_robot_config,
@@ -65,6 +74,7 @@ from humanoidverse.mjlab_inference_utils import (
 )
 from humanoidverse.mjlab_reward_relabel import CARRY_REWARD_COMPONENTS, RewardWrapperHV
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx
+from humanoidverse.utils.motion_data.object_physics import classify_carry_stages
 from humanoidverse.utils.robot_spec import load_robot_training_spec
 
 DEFAULT_TASKS = [
@@ -233,6 +243,117 @@ def _default_standing_target_states(wrapped_env, device: str) -> dict[str, torch
     return target_states
 
 
+def _carry_reference_target_states(
+    wrapped_env,
+    task: str,
+    device: str,
+) -> tuple[dict[str, torch.Tensor], str]:
+    """Choose a deterministic reference reset appropriate for a carry task."""
+
+    core = wrapped_env._env
+    lib = core._motion_lib
+    desired_stage = {
+        "carry-pick": CARRY_STAGE_PICKUP,
+        "carry-transport": CARRY_STAGE_TRANSPORT,
+        "carry-place": CARRY_STAGE_PLACE,
+        "carry-recover": CARRY_STAGE_APPROACH,
+        "carry-full": CARRY_STAGE_APPROACH,
+    }[task]
+    selected_motion = None
+    selected_frame = None
+    selected_stage = None
+    selected_stage_source = None
+    fallback = None
+    for motion_id in range(lib._num_motions):
+        start = int(lib.length_starts[motion_id].item())
+        count = int(lib._motion_num_frames[motion_id].item())
+        valid = lib.object_valid[start : start + count, 0] > 0.5
+        valid_frames = valid.nonzero(as_tuple=False).flatten()
+        if valid_frames.numel() == 0:
+            continue
+        phases = lib.object_phase[start : start + count, 0].round().long()
+        stage_source = "metadata"
+        if not torch.any(phases[valid] > 0):
+            phases = torch.as_tensor(
+                classify_carry_stages(
+                    lib.object_pos[start : start + count].detach().cpu().numpy(),
+                    lib.object_quat[start : start + count].detach().cpu().numpy(),
+                    lib.object_goal_pos[start : start + count].detach().cpu().numpy(),
+                    lib.object_valid[start : start + count].detach().cpu().numpy(),
+                    fps=1.0 / float(lib._motion_dt[motion_id].item()),
+                    collision_center=np.asarray(core.carry_box_cfg.collision_center, dtype=np.float32),
+                    half_extents=np.asarray(core.carry_box_cfg.half_extents, dtype=np.float32),
+                    lift_height_m=float(core.carry_box_cfg.lift_height),
+                    goal_tolerance_m=float(core.carry_box_cfg.goal_tolerance),
+                )[:, 0],
+                device=core.device,
+                dtype=torch.long,
+            )
+            stage_source = "derived-native-geometry"
+        candidates = (valid & (phases == desired_stage)).nonzero(as_tuple=False).flatten()
+        if candidates.numel() > 0:
+            selected_motion = motion_id
+            selected_frame = int(candidates[0].item())
+            selected_stage = desired_stage
+            selected_stage_source = stage_source
+            break
+        if fallback is None:
+            fallback_frame = int(valid_frames[0].item())
+            fallback = (
+                motion_id,
+                fallback_frame,
+                int(phases[fallback_frame].item()),
+                stage_source,
+            )
+    if selected_motion is None:
+        if fallback is None:
+            raise RuntimeError("Carry reward rollout data contains no object-bearing reference frame")
+        selected_motion, selected_frame, selected_stage, selected_stage_source = fallback
+
+    motion_ids = torch.tensor([selected_motion], device=core.device, dtype=torch.long)
+    motion_times = torch.tensor(
+        [selected_frame * float(lib._motion_dt[selected_motion].item())],
+        device=core.device,
+        dtype=torch.float32,
+    )
+    motion = lib.get_motion_state(motion_ids, motion_times, offset=core.env_origins[:1])
+    target_states = {
+        "root_states": torch.cat(
+            [motion["root_pos"], motion["root_rot"], motion["root_vel"], motion["root_ang_vel"]],
+            dim=-1,
+        ).to(device=device),
+        "dof_states": torch.stack([motion["dof_pos"], motion["dof_vel"]], dim=-1).to(device=device),
+        "object_states": torch.cat(
+            [
+                motion["object_pos"],
+                motion["object_quat"],
+                motion["object_lin_vel"],
+                motion["object_ang_vel"],
+            ],
+            dim=-1,
+        ).to(device=device),
+        "object_valid": motion["object_valid"].to(device=device),
+        "object_goal_pos": motion["object_goal_pos"].to(device=device),
+        # Native PKLs deliberately contain no staged-reset annotations.  Pass
+        # the derived phase so reset-time reward memory (ever_lifted) is still
+        # correct for transport/place rollout starts.
+        "object_phase": torch.full(
+            (1, 1),
+            float(selected_stage),
+            device=device,
+            dtype=torch.float32,
+        ),
+        "reference_motion_ids": motion_ids.to(device=device),
+        "reference_motion_times": motion_times.to(device=device),
+    }
+    stage_name = CARRY_STAGE_NAMES[max(0, min(int(selected_stage), len(CARRY_STAGE_NAMES) - 1))]
+    description = (
+        f"motion={lib.curr_motion_keys[selected_motion]} frame={selected_frame} "
+        f"stage={stage_name} stage_source={selected_stage_source}"
+    )
+    return target_states, description
+
+
 def _load_replay_buffer(
     model_folder: Path,
     *,
@@ -332,9 +453,13 @@ def run_reward_inference(
     model = load_model_from_checkpoint_dir(checkpoint_dir, device=model_load_device)
     model.to(device)
     model.eval()
-    if requested_tasks is None and int(getattr(model.cfg, "task_latent_dim", 0)) > 0:
+    model_obs_spaces = getattr(getattr(model, "obs_space", None), "spaces", {})
+    carry_conditioned_model = "goal_obs" in model_obs_spaces or int(
+        getattr(model.cfg, "task_latent_dim", 0)
+    ) > 0
+    if requested_tasks is None and carry_conditioned_model:
         tasks = [*tasks, *CARRY_REWARD_COMPONENTS.keys()]
-        task_support_mode += " + carry reward/task latent"
+        task_support_mode += " + carry object/goal observations"
 
     if export_onnx:
         _export_model(model, model_folder / "exported")
@@ -407,6 +532,11 @@ def run_reward_inference(
         disable_obs_noise=disable_obs_noise,
         max_episode_length_s=max_episode_length_s,
     )
+    env_cfg, _carry_compatibility = prepare_carry_inference_env_cfg(
+        env_cfg,
+        model,
+        disable_reset_certification=True,
+    )
     wrapped_env, _ = env_cfg.build(num_envs=1)
     renderer = None
     try:
@@ -428,14 +558,17 @@ def run_reward_inference(
                 if task in CARRY_REWARD_COMPONENTS:
                     if not wrapped_env._env._motion_lib.all_motions_loaded:
                         wrapped_env._env._motion_lib.load_all_motions()
+                    carry_target_states, carry_reset_description = _carry_reference_target_states(
+                        wrapped_env,
+                        task,
+                        device,
+                    )
 
                     def reset_rollout():
-                        for _ in range(64):
-                            reset_observation, reset_info = wrapped_env.reset(to_numpy=False)
-                            if bool(torch.any(reset_observation["object_obs"].abs() > 1.0e-6).item()):
-                                break
-                        else:
-                            raise RuntimeError("Could not reset a box-bearing motion for carry reward rollout")
+                        reset_observation, reset_info = wrapped_env.reset(
+                            to_numpy=False,
+                            target_states=carry_target_states,
+                        )
                         if carry_target is not None:
                             reset_observation = wrapped_env.set_carry_target_world(carry_target, to_numpy=False)
                         return reset_observation, reset_info
@@ -443,7 +576,10 @@ def run_reward_inference(
                     observation, _info = reset_rollout()
                     if carry_target is not None:
                         print(f"[INFO] Carry target overridden in world frame: {carry_target}")
-                    print("[INFO] Reset carry reward rollout with a persistent box task gate.")
+                    print(
+                        "[INFO] Reset carry reward rollout from deterministic source state: "
+                        f"{carry_reset_description}."
+                    )
                 else:
                     target_states = _default_standing_target_states(wrapped_env, device=device)
 
@@ -521,7 +657,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         metavar=("X", "Y", "Z"),
-        help="Optional world-frame target xyz for carry reward rollouts; encoded only through task z.",
+        help=(
+            "Optional world-frame target xyz for carry reward rollouts. New checkpoints expose it through "
+            "goal_obs without overwriting z; legacy checkpoints retain their compatibility adapter."
+        ),
     )
     add_bool_arg(parser, "--export-onnx", False, "Export ONNX next to the checkpoint before inference.")
     return resolve_inference_data_and_robot_args(parser.parse_args(), parser)

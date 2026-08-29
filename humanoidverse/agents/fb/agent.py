@@ -355,6 +355,15 @@ class FBAgent:
         return self._model.project_z(z)  # N x T x z_dim
 
     def maybe_update_rollout_context(self, z: torch.Tensor | None, step_count: torch.Tensor, replay_buffer: None = None) -> torch.Tensor:
+        def expert_rollout_env_count() -> int:
+            fraction = float(self.cfg.train.rollout_expert_trajectories_percentage)
+            if fraction <= 0.0 or step_count.numel() == 0:
+                return 0
+            # Smoke runs can contain fewer environments than 1/fraction.  A
+            # positive expert-rollout setting must still select one env rather
+            # than asking the trajectory buffer for an empty batch.
+            return min(step_count.shape[0], max(1, int(fraction * step_count.shape[0])))
+
         # get mask for environmets where we need to change z
         if z is not None:
             mask_reset_z = step_count % self.cfg.train.update_z_every_step == 0
@@ -366,18 +375,35 @@ class FBAgent:
             if self.cfg.train.rollout_expert_trajectories:
                 idxs = step_count % self.cfg.train.rollout_expert_trajectories_length
                 if torch.any(idxs == 0):
-                    n_elem = int(self.cfg.train.rollout_expert_trajectories_percentage*step_count.shape[0])
-                    self.env_idx_with_expert_rollout = torch.randint(0, step_count.shape[0], size=(n_elem,), device=self._model.device)
-                    self.tracking_z = self._sample_tracking_z(replay_buffer, n_elem, self.cfg.train.rollout_expert_trajectories_length)  # N x T x z_dim
-                mod_time = idxs[self.env_idx_with_expert_rollout].ravel()
-                z[self.env_idx_with_expert_rollout] = self.tracking_z[torch.arange(len(self.env_idx_with_expert_rollout), device=self._model.device), mod_time]
+                    n_elem = expert_rollout_env_count()
+                    if n_elem > 0:
+                        self.env_idx_with_expert_rollout = torch.randint(
+                            0, step_count.shape[0], size=(n_elem,), device=self._model.device
+                        )
+                        self.tracking_z = self._sample_tracking_z(
+                            replay_buffer,
+                            n_elem,
+                            self.cfg.train.rollout_expert_trajectories_length,
+                        )  # N x T x z_dim
+                if self.env_idx_with_expert_rollout is not None and len(self.env_idx_with_expert_rollout) > 0:
+                    mod_time = idxs[self.env_idx_with_expert_rollout].ravel()
+                    z[self.env_idx_with_expert_rollout] = self.tracking_z[
+                        torch.arange(len(self.env_idx_with_expert_rollout), device=self._model.device), mod_time
+                    ]
         else:
             z = self._model.sample_z(step_count.shape[0], device=self._model.device)
             if self.cfg.train.rollout_expert_trajectories:
-                n_elem = int(self.cfg.train.rollout_expert_trajectories_percentage*step_count.shape[0])
-                self.env_idx_with_expert_rollout = torch.randint(0, step_count.shape[0], size=(n_elem,), device=self._model.device)
-                self.tracking_z = self._sample_tracking_z(replay_buffer, n_elem, self.cfg.train.rollout_expert_trajectories_length)  # N x T x z_dim
-                z[self.env_idx_with_expert_rollout] = self.tracking_z[:, 0]
+                n_elem = expert_rollout_env_count()
+                if n_elem > 0:
+                    self.env_idx_with_expert_rollout = torch.randint(
+                        0, step_count.shape[0], size=(n_elem,), device=self._model.device
+                    )
+                    self.tracking_z = self._sample_tracking_z(
+                        replay_buffer,
+                        n_elem,
+                        self.cfg.train.rollout_expert_trajectories_length,
+                    )  # N x T x z_dim
+                    z[self.env_idx_with_expert_rollout] = self.tracking_z[:, 0]
         return z
 
     @classmethod

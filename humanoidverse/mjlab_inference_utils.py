@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 import humanoidverse
+from humanoidverse.agents.envs.carry_box import OBJECT_FRAME_DIM
 from humanoidverse.agents.envs.humanoidverse_mjlab import (
     HumanoidVerseMjlabConfig,
     G1_MJLAB_MJCF_PATH,
@@ -382,6 +383,53 @@ def load_mjlab_env_cfg(
     env_config["hydra_overrides"] = overrides
 
     return HumanoidVerseMjlabConfig(**env_config), use_root_height_obs
+
+
+def prepare_carry_inference_env_cfg(
+    env_cfg: HumanoidVerseMjlabConfig,
+    model: Any,
+    *,
+    disable_reset_certification: bool = False,
+) -> tuple[HumanoidVerseMjlabConfig, bool]:
+    """Align carry observations with a checkpoint without reviving train-time quirks.
+
+    New policies use five object frames and an explicit ``goal_obs``.  Legacy
+    checkpoints use four object frames and a three-dimensional ``task_command``
+    adapter.  The observation width is recovered from the checkpoint itself so
+    both formats can be played with the current environment code.
+    """
+
+    carry_box = getattr(env_cfg, "carry_box", None)
+    if not bool(getattr(carry_box, "enabled", False)):
+        return env_cfg, False
+
+    obs_space = getattr(model, "obs_space", None)
+    spaces = getattr(obs_space, "spaces", obs_space)
+    object_space = spaces.get("object_obs") if hasattr(spaces, "get") else None
+    object_history_steps = int(getattr(carry_box, "object_history_steps", 1))
+    if object_space is not None:
+        object_dim = int(object_space.shape[0])
+        if object_dim <= 0 or object_dim % OBJECT_FRAME_DIM != 0:
+            raise ValueError(
+                "Checkpoint object_obs width must be a positive multiple of "
+                f"{OBJECT_FRAME_DIM}, got {object_dim}"
+            )
+        object_history_steps = object_dim // OBJECT_FRAME_DIM
+
+    updates: dict[str, Any] = {}
+    legacy_task_command = int(getattr(model.cfg, "task_latent_dim", 0)) > 0
+    if bool(getattr(carry_box, "emit_legacy_task_command", False)) != legacy_task_command:
+        updates["emit_legacy_task_command"] = legacy_task_command
+    if int(getattr(carry_box, "object_history_steps", 1)) != object_history_steps:
+        updates["object_history_steps"] = object_history_steps
+    if disable_reset_certification:
+        if bool(getattr(carry_box, "stage_reset_curriculum", False)):
+            updates["stage_reset_curriculum"] = False
+        if bool(getattr(carry_box, "require_safe_reset_mask", False)):
+            updates["require_safe_reset_mask"] = False
+    if not updates:
+        return env_cfg, False
+    return env_cfg.model_copy(update={"carry_box": carry_box.model_copy(update=updates)}), True
 
 
 def to_rgb_uint8(frame: Any) -> np.ndarray:

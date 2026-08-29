@@ -153,33 +153,43 @@ TeCH was previously exposed as TLDR in early UFO versions. `--agent tldr` is kep
 ### Optional G1 carry-box task
 
 The isolated `--task carry_box` extension adds a visualized 0.5 kg rigid box
-and goal marker without changing the default `task=motion` environment. With
-no explicit data argument it balances full LaFAN and all 174 paired
-G1/large-box trajectories at 0.50/0.50. The deployable actor input is a
-four-frame window of box-relative position, 6-D rotation, and size. A single
-gated temporal discriminator judges robot style in walk mode and joint
-robot/box synchronization in carry mode; the Backward encoder still excludes
-current box state. Target position is carried by a reserved reward/task-latent
-tail, enabling pick, transport, place, and drop recovery without privileged
-actor flags. The processed PKLs and mesh remain self-contained in this repo.
+and goal marker without changing the default `task=motion` environment.
+Training uses `configs/data/lafan_g1_largebox.yaml`, which balances LaFAN and
+the 174 paired G1/large-box trajectories at 0.50/0.50. The checked-in box
+trajectories are already retargeted with G1 and are consumed at their native
+mesh scale, without another geometry resize or ground-trajectory shift.
+
+The actor receives the current box-relative pose and four past frames, plus an
+explicit heading-frame `goal_obs`. Actor, F, B, and critics consume the box and
+goal observations, while all 256 FB latent coordinates retain the same
+skill/reward semantics. The AMP branch judges robot style and robot/box
+synchronization without reading the goal or z as a shortcut.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-./run_train.sh \
+CUDA_VISIBLE_DEVICES=0 ./run_train.sh \
   --agent fb \
   --task carry_box \
-  --gpu-ids all \
+  --gpu-ids single \
   --num-envs 1024 \
   --num-env-steps 192000000 \
-  --work-dir runs/ufo_fb_g1_carry_box \
+  --work-dir runs/ufo_fb_g1_carry_box_native_goal_v4 \
+  --data-manifest configs/data/lafan_g1_largebox.yaml \
   --init-from runs/ufo_fb_g1/checkpoint \
   --update-z-every-step 100 \
-  --buffer-size 5120000
+  --buffer-size 5120000 \
+  --buffer-storage cpu \
+  --buffer-prefetch 2 \
+  --buffer-pin-memory-threads 2 \
+  --gpu-native-rollout \
+  --runtime-timing-every 25
 ```
 
-`--init-from` migrates model weights only; the new optimizer, replay, and
-training counters start fresh. See [Training and Inference](docs/TRAIN_INFERENCE.md)
-for the live MJLab playback command and the full machine-specific commands.
+Use a fresh work directory and initialize only from the original locomotion
+checkpoint. Carry checkpoints that predate `goal_obs` remain playable but are
+not valid training initialization or resume sources. `--init-from` migrates
+compatible model weights only; optimizer, replay, and counters start fresh.
+See [G1 carry-box training](README_BOX.md) for live source comparison, reward
+inference, and the eight-GPU profile.
 
 For one 32 GiB RTX 5090, use CPU replay with `--gpu-native-rollout`,
 `--buffer-prefetch 2`, and `--buffer-pin-memory-threads 2`. For eight H200s,

@@ -27,6 +27,7 @@ from humanoidverse.mjlab_inference_utils import (
     add_bool_arg,
     checkpoint_load_device,
     load_mjlab_env_cfg,
+    prepare_carry_inference_env_cfg,
     render_policy_frame,
 )
 from humanoidverse.utils.helpers import export_meta_policy_as_onnx, get_backward_observation
@@ -326,6 +327,7 @@ def _target_states_from_obs(obs_dict: dict[str, torch.Tensor], device: str, *, n
                 "object_states": object_state.unsqueeze(0),
                 "object_valid": obs_dict["object_valid"][0:1].to(device=device, dtype=torch.float32),
                 "object_goal_pos": obs_dict["object_goal_pos"][0:1].to(device=device, dtype=torch.float32),
+                "object_phase": obs_dict["object_phase"][0:1].to(device=device, dtype=torch.float32),
             }
         )
     return target_states
@@ -333,10 +335,7 @@ def _target_states_from_obs(obs_dict: dict[str, torch.Tensor], device: str, *, n
 
 @torch.no_grad()
 def _tracking_z(model: torch.nn.Module, obs: Any) -> torch.Tensor:
-    z = model.backward_map(obs)
-    for step in range(z.shape[0]):
-        z[step] = z[step : step + 1].mean(dim=0)
-    return model.project_z(z)
+    return model.tracking_inference(obs)
 
 
 def _export_policy_model(model: torch.nn.Module, output_dir: Path, robot_training: Any) -> dict[str, Any]:
@@ -393,7 +392,12 @@ def _resolve_tracking_robot_config(
     return resolve_robot_config_path(DEFAULT_ROBOT_CONFIG)
 
 
-def _prepare_tracking_playback_env_cfg(env_cfg: Any) -> tuple[Any, bool]:
+def _prepare_tracking_playback_env_cfg(
+    env_cfg: Any,
+    *,
+    model: torch.nn.Module | None = None,
+    emit_legacy_task_command: bool = False,
+) -> tuple[Any, bool]:
     """Disable training-only reset certification for exact playback.
 
     Tracking inference resets to the explicitly selected source trajectory and
@@ -410,8 +414,16 @@ def _prepare_tracking_playback_env_cfg(env_cfg: Any) -> tuple[Any, bool]:
     carry_box = getattr(env_cfg, "carry_box", None)
     if not bool(getattr(carry_box, "enabled", False)):
         return env_cfg, False
-    needs_override = bool(getattr(carry_box, "stage_reset_curriculum", False)) or bool(
-        getattr(carry_box, "require_safe_reset_mask", False)
+    if model is not None:
+        return prepare_carry_inference_env_cfg(
+            env_cfg,
+            model,
+            disable_reset_certification=True,
+        )
+    needs_override = (
+        bool(getattr(carry_box, "stage_reset_curriculum", False))
+        or bool(getattr(carry_box, "require_safe_reset_mask", False))
+        or bool(getattr(carry_box, "emit_legacy_task_command", False)) != emit_legacy_task_command
     )
     if not needs_override:
         return env_cfg, False
@@ -419,6 +431,7 @@ def _prepare_tracking_playback_env_cfg(env_cfg: Any) -> tuple[Any, bool]:
         update={
             "stage_reset_curriculum": False,
             "require_safe_reset_mask": False,
+            "emit_legacy_task_command": emit_legacy_task_command,
         }
     )
     return env_cfg.model_copy(update={"carry_box": playback_carry_box}), True
@@ -479,7 +492,10 @@ def run_tracking_inference(
         disable_obs_noise=disable_obs_noise,
         max_episode_length_s=max_episode_length_s,
     )
-    env_cfg, disabled_staged_reset = _prepare_tracking_playback_env_cfg(env_cfg)
+    env_cfg, disabled_staged_reset = _prepare_tracking_playback_env_cfg(
+        env_cfg,
+        model=model,
+    )
     if disabled_staged_reset:
         print(
             "[INFO] Tracking playback uses the source sequence directly; "

@@ -156,6 +156,11 @@ class PolicyExporterLSTM(torch.nn.Module):
 
 
 def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, velocity_multiplier: float = 1.0) -> torch.Tensor:
+    from humanoidverse.agents.envs.carry_box import (
+        carry_goal_observation,
+        object_observation,
+        temporal_object_history,
+    )
     from humanoidverse.utils.torch_utils import quat_rotate_inverse
     from humanoidverse.envs.motion_observations import compute_humanoid_observations_max, compute_humanoid_observations_max_with_contact
     
@@ -224,6 +229,7 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
             "object_ang_vel": motion_state["object_ang_vel"],
             "object_valid": motion_state["object_valid"],
             "object_goal_pos": motion_state["object_goal_pos"],
+            "object_phase": motion_state["object_phase"],
         }
         state = torch.cat([ref_dof_pos,
                     ref_dof_vel,
@@ -236,6 +242,26 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
             "last_action": last_action,
             "privileged_state": max_local_self_obs
         }
+        if bool(getattr(env, "carry_box_enabled", False)):
+            object_frames = object_observation(
+                base_pos=ref_body_pos[:, 0],
+                base_quat_xyzw=base_quat,
+                object_pos=motion_state["object_pos"],
+                object_quat_xyzw=motion_state["object_quat"],
+                valid=motion_state["object_valid"],
+                cfg=env.carry_box_cfg,
+            )
+            ufo_obs["object_obs"] = temporal_object_history(
+                object_frames,
+                history_steps=int(env.carry_box_cfg.object_history_steps),
+            )
+            ufo_obs["goal_obs"] = carry_goal_observation(
+                base_quat_xyzw=base_quat,
+                object_pos=motion_state["object_pos"],
+                goal_pos=motion_state["object_goal_pos"],
+                valid=motion_state["object_valid"],
+                cfg=env.carry_box_cfg,
+            )
         return ufo_obs, ref_dict
     else:
         ref_dict = {
@@ -244,7 +270,15 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
         return max_local_self_obs, ref_dict
 
 
-_SUPPORTED_POLICY_ACTOR_INPUT_KEYS = ("state", "last_action", "history_actor", "object_obs")
+_SUPPORTED_POLICY_ACTOR_INPUT_KEYS = (
+    "state",
+    "last_action",
+    "history_actor",
+    "object_obs",
+    "goal_obs",
+    # Inference-only support for checkpoints predating goal_obs.
+    "task_command",
+)
 
 
 def _as_actor_input_keys(raw_keys: Any) -> list[str]:
@@ -323,18 +357,27 @@ def _policy_output_action_dim(inference_model: nn.Module) -> int:
 
 
 def _infer_policy_onnx_export_spec(inference_model: nn.Module, z_dim: int) -> dict[str, Any]:
-    actor_input_keys = _get_policy_actor_input_keys(inference_model)
+    actor_filter_input_keys = _get_policy_actor_input_keys(inference_model)
+    actor_input_keys = list(actor_filter_input_keys)
+    legacy_task_dim = int(getattr(getattr(inference_model, "cfg", None), "task_latent_dim", 0))
+    legacy_task_key = getattr(getattr(inference_model, "cfg", None), "task_latent_key", None)
+    if legacy_task_dim > 0 and legacy_task_key not in actor_input_keys:
+        if not isinstance(legacy_task_key, str):
+            raise ValueError("Legacy task_latent_dim requires a string task_latent_key for ONNX export")
+        actor_input_keys.append(legacy_task_key)
     actor_input_dims = _actor_input_dims_from_obs_space(inference_model, actor_input_keys)
     actor_input_dim = sum(actor_input_dims.values())
+    actor_filter_input_dim = sum(actor_input_dims[key] for key in actor_filter_input_keys)
     filter_output_dim = _actor_filter_output_dim(inference_model)
-    if actor_input_dim != filter_output_dim:
+    if actor_filter_input_dim != filter_output_dim:
         raise ValueError(
             "Actor input dims inferred from obs_space do not match _actor.input_filter.output_space: "
-            f"sum(actor_input_dims)={actor_input_dim}, output_space_dim={filter_output_dim}, "
+            f"sum(actor_filter_input_dims)={actor_filter_input_dim}, output_space_dim={filter_output_dim}, "
             f"actor_input_dims={actor_input_dims}"
         )
     return {
         "actor_input_keys": actor_input_keys,
+        "actor_filter_input_keys": actor_filter_input_keys,
         "actor_input_dims": actor_input_dims,
         "z_dim": int(z_dim),
         "actor_input_dim": actor_input_dim,

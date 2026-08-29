@@ -29,12 +29,16 @@ CARRY_REWARD_COMPONENTS: dict[str, dict[str, float]] = {
     "carry-place": {"carry_transport_progress": 0.25, "carry_success": 1.0},
     "carry-recover": {"carry_recovery_progress": 1.0, "carry_drop_penalty": -0.25},
     "carry-full": {
-        "carry_approach": 0.1,
-        "carry_pick": 0.5,
-        "carry_transport_progress": 1.0,
-        "carry_success": 2.0,
-        "carry_recovery_progress": 0.5,
-        "carry_drop_penalty": -0.5,
+        # Keep reward inference on the same scale as the auxiliary objective
+        # used during training; softmax reward weighting is scale-sensitive.
+        "carry_approach": 0.2,
+        "carry_approach_progress": 0.5,
+        "carry_pick": 1.0,
+        "carry_transport_progress": 2.0,
+        "carry_success": 5.0,
+        "carry_recovery_progress": 1.0,
+        "carry_drop_penalty": -1.0,
+        "box_overspeed_penalty": -0.05,
     },
 }
 

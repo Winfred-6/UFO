@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from humanoidverse.agents.envs.carry_box import OBJECT_FRAME_DIM, OBJECT_HISTORY_STEPS, TASK_COMMAND_DIM
+from humanoidverse.agents.envs.carry_box import OBJECT_FRAME_DIM, OBJECT_HISTORY_STEPS
 from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig, FBcprAuxAgentTrainConfig
 from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
 from humanoidverse.agents.nn_filters import DictInputFilterConfig
@@ -101,20 +101,21 @@ def build_fb_agent(
 
     forward_keys = ["state", "privileged_state", "last_action", "history_actor"]
     actor_keys = ["state", "last_action", "history_actor"]
+    backward_keys = ["state", "privileged_state"]
     if carry_box:
-        forward_keys.append("object_obs")
-        actor_keys.append("object_obs")
+        # goal_obs is state-dependent (heading-frame box-to-goal), so it must
+        # travel through ordinary observations instead of replacing z[-3:].
+        forward_keys.extend(["object_obs", "goal_obs"])
+        actor_keys.extend(["object_obs", "goal_obs"])
+        # Object-aware B makes carry reward inference identifiable instead of
+        # relying on correlations in robot pose alone.
+        backward_keys.extend(["object_obs", "goal_obs"])
 
     return FBcprAuxAgentConfig(
         name="FBcprAuxAgent",
         model=FBcprAuxModelConfig(
             name="FBcprAuxModel",
             device=device,
-            task_latent_key="task_command" if carry_box else None,
-            task_latent_dim=TASK_COMMAND_DIM if carry_box else 0,
-            # task_command is normalized by the environment; this restores
-            # target offsets to metres in the reserved z tail.
-            task_latent_scale=5.0 if carry_box else 1.0,
             archi=FBcprAuxModelArchiConfig(
                 name="FBcprAuxModelArchiConfig",
                 z_dim=256,
@@ -136,7 +137,7 @@ def build_fb_agent(
                     hidden_dim=256,
                     hidden_layers=1,
                     norm=True,
-                    input_filter=DictInputFilterConfig(name="DictInputFilterConfig", key=["state", "privileged_state"]),
+                    input_filter=DictInputFilterConfig(name="DictInputFilterConfig", key=backward_keys),
                 ),
                 actor=ActorArchiConfig(
                     name="actor",
@@ -166,6 +167,7 @@ def build_fb_agent(
                         history_steps=4,
                         object_history_steps=OBJECT_HISTORY_STEPS,
                         object_frame_dim=OBJECT_FRAME_DIM,
+                        condition_on_z=False,
                     )
                     if carry_box
                     else DiscriminatorArchiConfig(
@@ -202,11 +204,7 @@ def build_fb_agent(
                         if carry_box
                         else {}
                     ),
-                    **(
-                        {"task_command": IdentityNormalizerConfig(name="IdentityNormalizerConfig")}
-                        if carry_box
-                        else {}
-                    ),
+                    **({"goal_obs": IdentityNormalizerConfig(name="IdentityNormalizerConfig")} if carry_box else {}),
                 },
                 allow_mismatching_keys=True,
             ),

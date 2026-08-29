@@ -6,10 +6,10 @@ import torch
 from humanoidverse.agents.envs.carry_box import (
     adaptive_carry_thresholds,
     box_collision_geometry,
+    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     object_observation,
-    task_latent_command,
     temporal_object_history,
 )
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
@@ -106,10 +106,13 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
                 valid=motion_res["object_valid"],
                 cfg=env.carry_box_cfg,
             )
-            object_obs = temporal_object_history(object_frames)
-            task_command = task_latent_command(
-                base_pos=ref_body_pos[:, 0],
+            object_obs = temporal_object_history(
+                object_frames,
+                history_steps=int(env.carry_box_cfg.object_history_steps),
+            )
+            goal_obs = carry_goal_observation(
                 base_quat_xyzw=base_quat,
+                object_pos=motion_res["object_pos"],
                 goal_pos=motion_res["object_goal_pos"],
                 valid=motion_res["object_valid"],
                 cfg=env.carry_box_cfg,
@@ -174,7 +177,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
                 f"{env._motion_lib._motion_data_keys[i]}: {history_actor.shape[0]} vs {curr_motion_len}"
             )
             assert object_obs.shape[0] == curr_motion_len
-            assert task_command.shape[0] == curr_motion_len
+            assert goal_obs.shape[0] == curr_motion_len
         if add_history_noaction:
             assert history_noaction.shape[0] == curr_motion_len
 
@@ -191,7 +194,7 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         if build_history_actor:
             ep["observation"]["history_actor"] = history_actor
             ep["observation"]["object_obs"] = object_obs
-            ep["observation"]["task_command"] = task_command
+            ep["observation"]["goal_obs"] = goal_obs
             ep["aux_rewards"] = {
                 key: value.unsqueeze(-1)
                 for key, value in carry_aux_rewards.items()

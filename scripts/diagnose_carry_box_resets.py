@@ -270,6 +270,9 @@ def main() -> None:
     diagnostic_carry_cfg = base_carry_cfg.model_copy(
         update={
             "require_safe_reset_mask": False,
+            # This diagnostic is also the explicit tool for examining legacy
+            # resized datasets; formal training remains fail-closed.
+            "require_native_reference_geometry": False,
             "half_extents": tuple(
                 float(value) * scale for value, scale in zip(base_carry_cfg.half_extents, box_scale)
             ),

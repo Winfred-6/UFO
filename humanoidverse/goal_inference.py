@@ -33,6 +33,7 @@ from humanoidverse.mjlab_inference_utils import (
     add_bool_arg,
     checkpoint_load_device,
     load_mjlab_env_cfg,
+    prepare_carry_inference_env_cfg,
     render_policy_frame,
     resolve_inference_data_and_robot_args,
     resolve_inference_robot_config,
@@ -194,6 +195,11 @@ def run_goal_inference(
         disable_dr=disable_dr,
         disable_obs_noise=disable_obs_noise,
         max_episode_length_s=max_episode_length_s,
+    )
+    env_cfg, _carry_compatibility = prepare_carry_inference_env_cfg(
+        env_cfg,
+        model,
+        disable_reset_certification=True,
     )
     wrapped_env, _ = env_cfg.build(num_envs=1)
     env = wrapped_env._env

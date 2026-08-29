@@ -60,9 +60,9 @@ class FBModelConfig(BaseModelConfig):
     seq_length: int = 1
     actor_std: float = 0.2
     amp: bool = False
-    # Optional high-level command embedded in a reserved tail of z.  The key
-    # remains outside every observation input filter; it is injected only at
-    # the model boundary so current object state never enters the z encoder.
+    # Deprecated inference compatibility for pre-goal_obs carry checkpoints.
+    # New presets keep these values unset so project_z normalizes the complete
+    # latent and no physical command is assigned to arbitrary FB coordinates.
     task_latent_key: str | None = None
     task_latent_dim: int = 0
     task_latent_scale: float = 1.0
@@ -151,7 +151,7 @@ class FBModel(BaseModel):
         z: torch.Tensor,
         obs: torch.Tensor | dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Inject the externally supplied reward/task command into z's tail."""
+        """Apply the deprecated z-tail adapter for legacy inference only."""
 
         task_dim = int(self.cfg.task_latent_dim)
         if task_dim <= 0:

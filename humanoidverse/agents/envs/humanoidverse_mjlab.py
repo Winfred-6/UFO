@@ -30,12 +30,14 @@ from humanoidverse.agents.base import BaseConfig
 from humanoidverse.agents.envs.carry_box import (
     CARRY_STAGE_COUNT,
     CARRY_STAGE_NAMES,
+    CARRY_STAGE_TRANSPORT,
     CarryBoxConfig,
     OBJECT_FRAME_DIM,
-    OBJECT_HISTORY_STEPS,
     adaptive_carry_thresholds,
+    assert_native_reference_geometry,
     box_collision_geometry,
     build_carry_box_scene_parts,
+    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     object_observation,
@@ -714,7 +716,7 @@ class HumanoidVerseMjlabCore:
             self.object_reset_stage = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
             self.object_obs_history = torch.zeros(
                 self.num_envs,
-                OBJECT_HISTORY_STEPS,
+                int(self.carry_box_cfg.object_history_steps),
                 OBJECT_FRAME_DIM,
                 device=self.device,
             )
@@ -847,6 +849,8 @@ class HumanoidVerseMjlabCore:
     def _init_motion_lib(self) -> None:
         self.config.robot.motion.step_dt = self.dt
         self._motion_lib = MotionLibRobot(self.config.robot.motion, num_envs=self.num_envs, device=self.device)
+        if self.carry_box_enabled and self.carry_box_cfg.require_native_reference_geometry:
+            assert_native_reference_geometry(self._motion_lib._motion_data_list)
         self._motion_lib.load_motions_for_training(max_num_seqs=self.num_envs)
         if self.carry_box_enabled and self.carry_box_cfg.require_safe_reset_mask:
             object_motions = self._motion_lib._motion_has_object
@@ -1143,7 +1147,16 @@ class HumanoidVerseMjlabCore:
             cfg=self.carry_box_cfg,
         )
 
-    def _task_latent_command(self) -> torch.Tensor:
+    def _goal_observation(self) -> torch.Tensor:
+        return carry_goal_observation(
+            base_quat_xyzw=self.base_quat,
+            object_pos=self.object_pos,
+            goal_pos=self.object_goal_pos,
+            valid=self.object_valid,
+            cfg=self.carry_box_cfg,
+        )
+
+    def _legacy_task_latent_command(self) -> torch.Tensor:
         return task_latent_command(
             base_pos=self.robot_root_states[:, :3],
             base_quat_xyzw=self.base_quat,
@@ -1158,6 +1171,67 @@ class HumanoidVerseMjlabCore:
         current = self._current_object_frame()[env_ids]
         self.object_obs_history[env_ids] = 0.0
         self.object_obs_history[env_ids, 0] = current
+
+    def _hydrate_reference_histories(self, env_ids: torch.Tensor) -> None:
+        """Populate RSI history from frames preceding the sampled reference.
+
+        Mid-sequence reference-state initialization must not look like an
+        episode boundary to the policy or discriminator.  Values before the
+        beginning of a clip remain zero, matching the expert loader.
+        """
+
+        if len(env_ids) == 0:
+            return
+        max_robot_lag = max(self.history_handler.buffer_config.values(), default=0)
+        object_history_steps = int(self.carry_box_cfg.object_history_steps)
+        max_object_lag = object_history_steps - 1 if self.carry_box_enabled else 0
+        max_lag = max(max_robot_lag, max_object_lag)
+        for lag in range(1, max_lag + 1):
+            times = self.motion_start_times[env_ids] - lag * self.dt
+            available = times >= 0.0
+            if not torch.any(available):
+                continue
+            selected_env_ids = env_ids[available]
+            motion_res = self._motion_lib.get_motion_state(
+                self.motion_ids[selected_env_ids],
+                times[available],
+                offset=self.env_origins[selected_env_ids],
+            )
+            root_quat = motion_res["root_rot"]
+            history_values = {
+                "actions": torch.zeros_like(motion_res["dof_pos"]),
+                "base_ang_vel": quat_rotate_inverse(
+                    root_quat,
+                    motion_res["root_ang_vel"],
+                    w_last=True,
+                ),
+                "dof_pos": motion_res["dof_pos"]
+                - (
+                    self.default_dof_pos[selected_env_ids]
+                    + self.default_dof_pos_offset[selected_env_ids]
+                ),
+                "dof_vel": motion_res["dof_vel"],
+                "projected_gravity": quat_rotate_inverse(
+                    root_quat,
+                    self.gravity_vec[selected_env_ids],
+                    w_last=True,
+                ),
+            }
+            for key, value in history_values.items():
+                history_values[key] = value * float(self.config.obs.obs_scales.get(key, 1.0))
+            for key, history in self.history_handler.history.items():
+                if lag <= history.shape[1]:
+                    history[selected_env_ids, lag - 1] = history_values[key]
+
+            if self.carry_box_enabled and lag < object_history_steps:
+                self.object_obs_history[selected_env_ids, lag] = object_observation(
+                    base_pos=motion_res["root_pos"],
+                    base_quat_xyzw=root_quat,
+                    object_pos=motion_res["object_pos"],
+                    object_quat_xyzw=motion_res["object_quat"],
+                    valid=motion_res["object_valid"],
+                    cfg=self.carry_box_cfg,
+                )
 
     def _advance_carry_observation_history(self) -> None:
         if not self.carry_box_enabled:
@@ -1190,7 +1264,10 @@ class HumanoidVerseMjlabCore:
         lift_fraction = torch.clamp(lift_clearance / lift_height, min=0.0, max=1.0)
         self.prev_box_lift_fraction[env_ids] = lift_fraction
         lifted = lift_fraction >= 1.0
-        self.object_ever_lifted[env_ids] = lifted & self.object_valid[env_ids, 0].bool()
+        lifted_before_reset = self.object_reset_stage[env_ids] >= CARRY_STAGE_TRANSPORT
+        self.object_ever_lifted[env_ids] = (
+            lifted | lifted_before_reset
+        ) & self.object_valid[env_ids, 0].bool()
 
     def _read_contact_forces(self) -> torch.Tensor:
         forces = torch.zeros(self.num_envs, self.num_bodies, 3, device=self.device)
@@ -1293,9 +1370,9 @@ class HumanoidVerseMjlabCore:
         }
         if self.carry_box_enabled:
             obs["object_obs"] = self._object_observation()
-            # This key is consumed only by the structured reward/task latent
-            # adapter.  Actor/F/critics never concatenate it as observation.
-            obs["task_command"] = self._task_latent_command()
+            obs["goal_obs"] = self._goal_observation()
+            if self.carry_box_cfg.emit_legacy_task_command:
+                obs["task_command"] = self._legacy_task_latent_command()
         if include_last_action:
             obs["last_action"] = raw_obs["actions"]
         obs["time"] = self.episode_length_buf.unsqueeze(-1)
@@ -1431,7 +1508,7 @@ class HumanoidVerseMjlabCore:
         goal_pos: torch.Tensor | np.ndarray | list[float],
         env_ids: torch.Tensor | None = None,
     ) -> None:
-        """Set a deployable world-frame carry target without exposing it as actor state."""
+        """Set a world-frame carry target and refresh goal-dependent state."""
 
         if not self.carry_box_enabled:
             raise RuntimeError("set_carry_target_world requires carry_box.enabled=True")
@@ -1447,6 +1524,9 @@ class HumanoidVerseMjlabCore:
         if target.shape != (len(env_ids), 3):
             raise ValueError(f"Expected carry targets [{len(env_ids)}, 3], got {tuple(target.shape)}")
         self.object_goal_pos[env_ids] = target
+        self.prev_box_goal_distance[env_ids] = torch.linalg.vector_norm(
+            target - self.object_pos[env_ids], dim=-1
+        )
         target_pose_wxyz = torch.cat(
             [
                 target,
@@ -1462,7 +1542,28 @@ class HumanoidVerseMjlabCore:
             return
         self.mjlab_env.reset(env_ids=env_ids)
         self._randomize_default_dof_pos_offset(env_ids)
+        hydrate_reference_history = target_states is None
+        object_phase = None
         if target_states is not None:
+            reference_motion_ids = target_states.get("reference_motion_ids")
+            reference_motion_times = target_states.get("reference_motion_times")
+            if (reference_motion_ids is None) != (reference_motion_times is None):
+                raise ValueError(
+                    "target_states must provide reference_motion_ids and reference_motion_times together"
+                )
+            if reference_motion_ids is not None:
+                sampled_motion_ids = reference_motion_ids[env_ids].to(
+                    self.device,
+                    dtype=torch.long,
+                )
+                sampled_motion_times = reference_motion_times[env_ids].to(
+                    self.device,
+                    dtype=torch.float32,
+                )
+                self.motion_ids[env_ids] = sampled_motion_ids
+                self.motion_start_times[env_ids] = sampled_motion_times
+                self.motion_len[env_ids] = self._motion_lib.get_motion_length(sampled_motion_ids)
+                hydrate_reference_history = True
             root_xyzw = target_states["root_states"][env_ids].to(self.device, dtype=torch.float32)
             dof_state = target_states["dof_states"][env_ids].to(self.device, dtype=torch.float32)
             joint_pos = dof_state[..., 0]
@@ -1470,12 +1571,15 @@ class HumanoidVerseMjlabCore:
             object_state_xyzw = target_states.get("object_states")
             object_valid = target_states.get("object_valid")
             object_goal_pos = target_states.get("object_goal_pos")
+            object_phase = target_states.get("object_phase")
             if object_state_xyzw is not None:
                 object_state_xyzw = object_state_xyzw[env_ids]
             if object_valid is not None:
                 object_valid = object_valid[env_ids]
             if object_goal_pos is not None:
                 object_goal_pos = object_goal_pos[env_ids]
+            if object_phase is not None:
+                object_phase = object_phase[env_ids]
         else:
             self._resample_motion_time_and_ids(env_ids)
             motion_times = self.motion_start_times[env_ids]
@@ -1531,6 +1635,7 @@ class HumanoidVerseMjlabCore:
             )
             object_valid = motion_res["object_valid"]
             object_goal_pos = motion_res["object_goal_pos"]
+            object_phase = motion_res["object_phase"]
 
         root_wxyz = torch.cat([root_xyzw[:, :3], xyzw_to_wxyz(root_xyzw[:, 3:7]), root_xyzw[:, 7:13]], dim=-1)
         self.robot.write_root_state_to_sim(root_wxyz, env_ids=env_ids)
@@ -1540,7 +1645,7 @@ class HumanoidVerseMjlabCore:
                 object_state_xyzw = torch.zeros((len(env_ids), 13), device=self.device, dtype=torch.float32)
                 object_state_xyzw[:, 6] = 1.0
             if object_valid is None:
-                object_valid = torch.ones((len(env_ids), 1), device=self.device, dtype=torch.float32)
+                object_valid = torch.zeros((len(env_ids), 1), device=self.device, dtype=torch.float32)
             if object_goal_pos is None:
                 object_goal_pos = object_state_xyzw[:, :3].clone()
             object_state_xyzw = object_state_xyzw.to(self.device, dtype=torch.float32)
@@ -1576,6 +1681,12 @@ class HumanoidVerseMjlabCore:
             self.carry_target.write_mocap_pose_to_sim(target_pose_wxyz, env_ids=env_ids)
             self.object_valid[env_ids] = object_valid
             self.object_goal_pos[env_ids] = object_goal_pos
+            if object_phase is None:
+                self.object_reset_stage[env_ids] = 0
+            else:
+                self.object_reset_stage[env_ids] = object_phase.to(
+                    self.device, dtype=torch.float32
+                ).reshape(-1).round().long().clamp(0, CARRY_STAGE_COUNT - 1)
         self.mjlab_env.scene.write_data_to_sim()
         self.mjlab_env.sim.forward()
         self.mjlab_env._manual_reset_pending[env_ids] = False
@@ -1584,6 +1695,8 @@ class HumanoidVerseMjlabCore:
         self.history_handler.reset(env_ids)
         self._refresh_state()
         self._reset_carry_observation_history(env_ids)
+        if hydrate_reference_history:
+            self._hydrate_reference_histories(env_ids)
         self._assert_carry_physics_sane("post_reset")
         self._reset_carry_progress(env_ids)
         self.simulator.refresh()

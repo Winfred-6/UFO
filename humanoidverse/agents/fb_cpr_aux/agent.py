@@ -196,7 +196,6 @@ class FBcprAuxAgent(FBcprAgent):
             torch.compiler.cudagraph_mark_step_begin()
             expert_z = self.encode_expert(next_obs=expert_next_obs)
             train_z = train_batch["z"].to(self.device)
-            train_z = self._model.condition_task_latent(train_z, train_obs)
             self._diagnostic_assert_finite({"expert_z": expert_z, "train_z": train_z}, "initial_latents", step)
 
         # train the discriminator
@@ -205,7 +204,9 @@ class FBcprAuxAgent(FBcprAgent):
         mismatch_z = None
         mismatch_coef = 0.0
         if self.cfg.train.balanced_object_discriminator:
-            expert_disc_obs, expert_disc_z, expert_gate = self._balanced_discriminator_batch(expert_obs, expert_z)
+            expert_disc_obs, expert_disc_z, expert_gate = self._balanced_discriminator_batch(
+                expert_obs, expert_z
+            )
             train_disc_obs, train_disc_z, train_gate = self._balanced_discriminator_batch(train_obs, train_z)
             mismatch_obs = self._mismatched_object_negative(expert_disc_obs, expert_gate)
             mismatch_z = expert_disc_z
@@ -239,7 +240,6 @@ class FBcprAuxAgent(FBcprAgent):
             if self.cfg.train.relabel_ratio is not None:
                 mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
                 train_z = torch.where(mask, z, train_z)
-            train_z = self._model.condition_task_latent(train_z, train_obs)
 
         q_loss_coef = self.cfg.train.q_loss_coef if self.cfg.train.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.train.clip_grad_norm if self.cfg.train.clip_grad_norm > 0 else None
@@ -344,7 +344,7 @@ class FBcprAuxAgent(FBcprAgent):
         z: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
-            num_parallel = self.cfg.model.archi.critic.num_parallel
+            num_parallel = self.cfg.model.archi.aux_critic.num_parallel
             # compute target critic
             with torch.no_grad():
                 dist = self._model._actor(next_obs, z, self._model.cfg.actor_std)

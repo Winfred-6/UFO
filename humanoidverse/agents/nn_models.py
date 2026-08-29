@@ -186,6 +186,9 @@ class ConditionalTemporalDiscriminatorArchiConfig(BaseConfig):
     history_key: str = "history_actor"
     action_key: str = "last_action"
     object_key: str = "object_obs"
+    # Carry goals are encoded by B for FB/reward inference, but the style
+    # discriminator must not learn target-coordinate shortcuts through z.
+    condition_on_z: bool = True
 
     def build(self, obs_space, z_dim) -> "ConditionalTemporalDiscriminator":
         return ConditionalTemporalDiscriminator(obs_space, z_dim, self)
@@ -441,8 +444,9 @@ class ConditionalTemporalDiscriminator(nn.Module):
             nn.LayerNorm(temporal_dim),
             nn.Tanh(),
         )
+        robot_input_dim = 2 * temporal_dim + (z_dim if cfg.condition_on_z else 0)
         self.robot_encoder = nn.Sequential(
-            nn.Linear(2 * temporal_dim + z_dim, cfg.hidden_dim),
+            nn.Linear(robot_input_dim, cfg.hidden_dim),
             nn.LayerNorm(cfg.hidden_dim),
             nn.Tanh(),
         )
@@ -494,7 +498,10 @@ class ConditionalTemporalDiscriminator(nn.Module):
         robot_sequence = self._robot_sequence(obs)
         temporal_robot = self.robot_temporal(robot_sequence.transpose(1, 2)).squeeze(-1)
         privileged = self.privileged_encoder(obs[self.cfg.privileged_key])
-        robot = self.robot_encoder(torch.cat([z, temporal_robot, privileged], dim=-1))
+        robot_inputs = [temporal_robot, privileged]
+        if self.cfg.condition_on_z:
+            robot_inputs.insert(0, z)
+        robot = self.robot_encoder(torch.cat(robot_inputs, dim=-1))
 
         object_sequence = obs[self.cfg.object_key].reshape(
             -1,

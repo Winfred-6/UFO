@@ -34,6 +34,27 @@ def test_tracking_playback_disables_training_reset_certification() -> None:
     assert env_cfg.carry_box.require_safe_reset_mask is True
 
 
+def test_tracking_playback_restores_legacy_object_width_and_task_adapter() -> None:
+    env_cfg = HumanoidVerseMjlabConfig(
+        lafan_tail_path="motions.pkl",
+        carry_box=CarryBoxConfig(enabled=True),
+    )
+    legacy_model = SimpleNamespace(
+        obs_space=SimpleNamespace(
+            spaces={"object_obs": SimpleNamespace(shape=(48,))},
+        ),
+        cfg=SimpleNamespace(task_latent_dim=3),
+    )
+
+    playback_cfg, changed = _prepare_tracking_playback_env_cfg(env_cfg, model=legacy_model)
+
+    assert changed
+    assert playback_cfg.carry_box.object_history_steps == 4
+    assert playback_cfg.carry_box.emit_legacy_task_command is True
+    assert env_cfg.carry_box.object_history_steps == 5
+    assert env_cfg.carry_box.emit_legacy_task_command is False
+
+
 def test_live_reference_writes_synchronized_robot_box_and_target() -> None:
     scene = {
         "robot": _entity(free_qpos=[2, 3, 4, 5, 6, 7, 8], joint_qpos=[0, 1]),

@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import joblib
+import numpy as np
 import torch
 
 from humanoidverse.agents.envs.carry_box import (
@@ -17,9 +18,10 @@ from humanoidverse.agents.envs.carry_box import (
 )
 from humanoidverse.agents.presets.fb import build_fb_agent
 from humanoidverse.train import build_ufo_mjlab_config
+from humanoidverse.utils.motion_data.object_physics import classify_carry_stages
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_PATH = PROJECT_ROOT / "humanoidverse/data/g1_largebox_g1fit_full_ufo.pkl"
+DEFAULT_DATA_PATH = PROJECT_ROOT / "humanoidverse/data/g1_largebox_full_ufo.pkl"
 
 
 def _summary(values: list[torch.Tensor]) -> dict[str, float]:
@@ -71,6 +73,29 @@ def main() -> None:
         motion_ids = torch.arange(motion_count, device=core.device, dtype=torch.long)
         frame_counts = lib._motion_num_frames.long()
         max_frames = int(frame_counts.max().item())
+        diagnostic_phase = lib.object_phase.clone()
+        for motion_id in range(lib._num_motions):
+            start = int(lib.length_starts[motion_id].item())
+            count = int(frame_counts[motion_id].item())
+            valid = lib.object_valid[start : start + count, 0] > 0.5
+            if not torch.any(valid) or torch.any(diagnostic_phase[start : start + count, 0][valid] > 0):
+                continue
+            phases = classify_carry_stages(
+                lib.object_pos[start : start + count].detach().cpu().numpy(),
+                lib.object_quat[start : start + count].detach().cpu().numpy(),
+                lib.object_goal_pos[start : start + count].detach().cpu().numpy(),
+                lib.object_valid[start : start + count].detach().cpu().numpy(),
+                fps=1.0 / float(lib._motion_dt[motion_id].item()),
+                collision_center=np.asarray(core.carry_box_cfg.collision_center, dtype=np.float32),
+                half_extents=np.asarray(core.carry_box_cfg.half_extents, dtype=np.float32),
+                lift_height_m=float(core.carry_box_cfg.lift_height),
+                goal_tolerance_m=float(core.carry_box_cfg.goal_tolerance),
+            )
+            diagnostic_phase[start : start + count] = torch.as_tensor(
+                phases,
+                device=core.device,
+                dtype=diagnostic_phase.dtype,
+            )
         carry_scales = {
             key: value
             for key, value in build_fb_agent(device="cpu", compile=False, carry_box=True).aux_rewards_scaling.items()
@@ -136,7 +161,11 @@ def main() -> None:
             weighted = torch.zeros(motion_count, device=core.device)
             for key, scale in carry_scales.items():
                 weighted += float(scale) * aux[key]
-            phase = motion["object_phase"][:, 0].round().long()
+            frame_ids = torch.minimum(
+                torch.full_like(frame_counts, frame),
+                frame_counts - 1,
+            )
+            phase = diagnostic_phase[lib.length_starts.long() + frame_ids, 0].round().long()
             finite_values = [*aux.values(), *state.values(), weighted]
             if any(value.is_floating_point() and not torch.isfinite(value).all() for value in finite_values):
                 raise FloatingPointError(f"Non-finite expert carry reward at frame={frame}")

@@ -16,12 +16,13 @@ from humanoidverse.agents.envs.carry_box import (
     OBJECT_HISTORY_STEPS,
     OBJECT_OBS_DIM,
     CarryBoxConfig,
+    assert_native_reference_geometry,
+    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     make_carry_box_spec,
     object_observation,
     parked_box_local_position,
-    task_latent_command,
     temporal_object_history,
 )
 from humanoidverse.agents.nn_models import ConditionalTemporalDiscriminatorArchiConfig
@@ -180,16 +181,16 @@ class CarryBoxTest(unittest.TestCase):
         torch.testing.assert_close(history[0, :OBJECT_FRAME_DIM], frame[0])
         torch.testing.assert_close(history[0, OBJECT_FRAME_DIM:], torch.zeros(OBJECT_OBS_DIM - OBJECT_FRAME_DIM))
 
-    def test_target_is_a_separate_task_latent_command(self) -> None:
+    def test_target_is_a_separate_box_to_goal_observation(self) -> None:
         identity = torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]])
-        command = task_latent_command(
-            base_pos=torch.zeros(2, 3),
+        command = carry_goal_observation(
             base_quat_xyzw=identity,
-            goal_pos=torch.tensor([[2.5, -5.0, 7.5], [1.0, 1.0, 1.0]]),
+            object_pos=torch.tensor([[1.0, 2.0, 3.0], [9.0, 9.0, 9.0]]),
+            goal_pos=torch.tensor([[2.5, -1.0, 4.0], [1.0, 1.0, 1.0]]),
             valid=torch.tensor([[1.0], [0.0]]),
             cfg=CarryBoxConfig(),
         )
-        torch.testing.assert_close(command[0], torch.tensor([0.5, -1.0, 1.0]))
+        torch.testing.assert_close(command[0], torch.tensor([1.5, -3.0, 1.0]))
         torch.testing.assert_close(command[1], torch.zeros(3))
 
     def test_large_box_approach_distance_uses_surface_not_center(self) -> None:
@@ -332,6 +333,19 @@ class CarryBoxTest(unittest.TestCase):
         np.testing.assert_allclose(restored.half_extents, legacy["half_extents"], atol=0.0)
         np.testing.assert_allclose(restored.collision_center, legacy["collision_center"], atol=0.0)
         np.testing.assert_allclose(restored.visual_mesh_scale, (1.0, 1.0, 1.0), atol=0.0)
+        self.assertFalse(restored.require_safe_reset_mask)
+        self.assertFalse(restored.stage_reset_curriculum)
+
+    def test_formal_training_rejects_resized_reference_metadata(self) -> None:
+        records = [
+            {
+                "motion_key": "bad_g1fit",
+                "object_valid": np.ones((1, 1), dtype=np.float32),
+                "metadata": {"object_geometry_retarget": {"mesh_scale": [0.55, 0.55, 0.55]}},
+            }
+        ]
+        with self.assertRaisesRegex(ValueError, "native, unscaled object trajectories"):
+            assert_native_reference_geometry(records)
 
     def test_collision_bounds_match_the_visual_mesh(self) -> None:
         cfg = CarryBoxConfig()
@@ -409,21 +423,20 @@ class CarryBoxTest(unittest.TestCase):
         np.testing.assert_allclose(velocity[:, 2], np.full(2, 7.5), atol=1.0e-5)
         np.testing.assert_allclose(goal[:, 2], np.full(2, 0.626), atol=1.0e-5)
 
-    def test_box_state_stays_out_of_backward_but_enters_conditional_discriminator(self) -> None:
+    def test_box_and_goal_are_explicit_fb_inputs_but_goal_stays_out_of_style_discriminator(self) -> None:
         cfg = build_fb_agent(device="cpu", compile=False, carry_box=True)
         arch = cfg.model.archi
-        self.assertIn("object_obs", arch.actor.input_filter.key)
-        self.assertIn("object_obs", arch.f.input_filter.key)
-        self.assertIn("object_obs", arch.critic.input_filter.key)
-        self.assertIn("object_obs", arch.aux_critic.input_filter.key)
-        self.assertNotIn("object_obs", arch.b.input_filter.key)
+        for network in (arch.actor, arch.f, arch.critic, arch.aux_critic, arch.b):
+            self.assertIn("object_obs", network.input_filter.key)
+            self.assertIn("goal_obs", network.input_filter.key)
         self.assertEqual(arch.discriminator.object_key, "object_obs")
-        self.assertEqual(cfg.model.task_latent_key, "task_command")
-        self.assertNotIn("task_command", arch.actor.input_filter.key)
-        self.assertNotIn("task_command", arch.b.input_filter.key)
+        self.assertFalse(arch.discriminator.condition_on_z)
+        self.assertEqual(cfg.model.task_latent_dim, 0)
+        self.assertIsNone(cfg.model.task_latent_key)
 
         legacy = build_fb_agent(device="cpu", compile=False, carry_box=False)
         self.assertNotIn("object_obs", legacy.model.archi.actor.input_filter.key)
+        self.assertNotIn("goal_obs", legacy.model.archi.actor.input_filter.key)
         self.assertNotIn("object_obs", legacy.model.obs_normalizer.normalizers)
 
     def test_conditional_temporal_discriminator_gates_box_branch_for_walk(self) -> None:
@@ -434,6 +447,7 @@ class CarryBoxTest(unittest.TestCase):
                 "history_actor": spaces.Box(-np.inf, np.inf, shape=(372,), dtype=np.float32),
                 "last_action": spaces.Box(-np.inf, np.inf, shape=(29,), dtype=np.float32),
                 "object_obs": spaces.Box(-np.inf, np.inf, shape=(OBJECT_OBS_DIM,), dtype=np.float32),
+                "goal_obs": spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
             }
         )
         discriminator = ConditionalTemporalDiscriminatorArchiConfig(
@@ -442,6 +456,7 @@ class CarryBoxTest(unittest.TestCase):
             history_steps=4,
             object_history_steps=OBJECT_HISTORY_STEPS,
             object_frame_dim=OBJECT_FRAME_DIM,
+            condition_on_z=False,
         ).build(obs_space, z_dim=16)
         base_obs = {
             "state": torch.randn(3, 64),
@@ -449,6 +464,7 @@ class CarryBoxTest(unittest.TestCase):
             "history_actor": torch.randn(3, 372),
             "last_action": torch.randn(3, 29),
             "object_obs": torch.zeros(3, OBJECT_OBS_DIM),
+            "goal_obs": torch.randn(3, 3),
         }
         z = torch.randn(3, 16)
         walk_logits = discriminator.compute_logits(base_obs, z)
@@ -462,6 +478,10 @@ class CarryBoxTest(unittest.TestCase):
         carry_obs["object_obs"][:, OBJECT_FRAME_DIM - 3 : OBJECT_FRAME_DIM] = 0.5
         torch.testing.assert_close(discriminator.task_gate(carry_obs), torch.ones(3, 1))
         self.assertFalse(torch.allclose(discriminator.compute_logits(carry_obs, z), walk_logits))
+        torch.testing.assert_close(
+            discriminator.compute_logits(carry_obs, z),
+            discriminator.compute_logits(carry_obs, torch.randn_like(z)),
+        )
 
     def test_source_priorities_preserve_lafan_carry_mix(self) -> None:
         buffer = TrajectoryDictBuffer(
@@ -494,17 +514,19 @@ class CarryBoxTest(unittest.TestCase):
         prefix_dim = 2
         z_dim = 4
         source = torch.arange(prefix_dim + 19 + z_dim, dtype=torch.float32).reshape(1, -1)
-        destination = torch.full((1, prefix_dim + OBJECT_OBS_DIM + z_dim), -1.0)
+        goal_dim = 3
+        destination = torch.full((1, prefix_dim + OBJECT_OBS_DIM + goal_dim + z_dim), -1.0)
         migrated = _copy_replacing_object_features(
             source,
             destination,
             source_object_dim=19,
             destination_object_dim=OBJECT_OBS_DIM,
+            source_goal_dim=0,
+            destination_goal_dim=goal_dim,
             tail_count=z_dim,
             zero_new_object=True,
             map_legacy_pose=True,
-            map_legacy_goal_to_task=True,
-            task_latent_dim=3,
+            map_legacy_goal=True,
         )
         self.assertIsNotNone(migrated)
         torch.testing.assert_close(migrated[:, :prefix_dim], source[:, :prefix_dim])
@@ -515,7 +537,12 @@ class CarryBoxTest(unittest.TestCase):
             migrated[:, prefix_dim + 9 : prefix_dim + OBJECT_OBS_DIM],
             torch.zeros(1, OBJECT_OBS_DIM - 9),
         )
-        torch.testing.assert_close(migrated[:, -3:], source[:, prefix_dim + 16 : prefix_dim + 19])
+        goal_start = prefix_dim + OBJECT_OBS_DIM
+        torch.testing.assert_close(
+            migrated[:, goal_start : goal_start + goal_dim],
+            source[:, prefix_dim + 16 : prefix_dim + 19],
+        )
+        torch.testing.assert_close(migrated[:, -z_dim:], source[:, -z_dim:])
 
     def test_reward_mode_can_infer_pick_latent_directly_from_carry_replay(self) -> None:
         class Dataset:

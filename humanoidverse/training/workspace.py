@@ -353,8 +353,8 @@ def _copy_with_inserted_features(
     return result
 
 
-def _source_object_observation_dim(model_path: Path) -> int:
-    """Read the source checkpoint's serialized observation shape."""
+def _source_observation_dim(model_path: Path, key: str) -> int:
+    """Read one serialized observation width from a source checkpoint."""
 
     candidates = (
         model_path.parent.parent / "init_kwargs.json",
@@ -365,14 +365,40 @@ def _source_object_observation_dim(model_path: Path) -> int:
             continue
         with candidate.open() as file:
             payload = json.load(file)
-        object_space = payload.get("obs_space", {}).get("spaces", {}).get("object_obs")
-        if object_space is None:
+        observation_space = payload.get("obs_space", {}).get("spaces", {}).get(key)
+        if observation_space is None:
             return 0
-        shape = object_space.get("shape", [])
+        shape = observation_space.get("shape", [])
         if len(shape) != 1:
-            raise ValueError(f"Invalid source object_obs shape in {candidate}: {shape}")
+            raise ValueError(f"Invalid source {key} shape in {candidate}: {shape}")
         return int(shape[0])
-    # Older locomotion checkpoints predate object observations.
+    # Older locomotion checkpoints predate carry observations.
+    return 0
+
+
+def _source_object_observation_dim(model_path: Path) -> int:
+    """Backward-compatible wrapper used by older tests/tools."""
+
+    return _source_observation_dim(model_path, "object_obs")
+
+
+def _source_task_latent_dim(model_path: Path) -> int:
+    """Read the deprecated task-latent width from either checkpoint config."""
+
+    candidates = (
+        model_path.parent.parent / "config.json",
+        model_path.parent / "config.json",
+    )
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        with candidate.open() as file:
+            payload = json.load(file)
+        value = payload.get("task_latent_dim")
+        if value is None and isinstance(payload.get("model"), dict):
+            value = payload["model"].get("task_latent_dim")
+        if value is not None:
+            return int(value)
     return 0
 
 
@@ -382,23 +408,26 @@ def _copy_replacing_object_features(
     *,
     source_object_dim: int,
     destination_object_dim: int,
+    source_goal_dim: int,
+    destination_goal_dim: int,
     tail_count: int,
     zero_new_object: bool,
     map_legacy_pose: bool,
-    map_legacy_goal_to_task: bool,
-    task_latent_dim: int,
+    map_legacy_goal: bool,
 ) -> torch.Tensor | None:
-    """Migrate network inputs while replacing the old object feature block.
+    """Migrate object/goal input blocks without reinterpreting z coordinates.
 
-    Non-object observation columns and z/action tails are copied exactly.  New
-    object columns start at zero.  For the former 19-D carry format, the nine
-    semantically identical position/rotation columns are retained; obsolete
-    valid/velocity/goal columns are never silently reinterpreted as new data.
+    Non-carry observation columns and z/action tails are copied exactly.  New
+    carry columns start at zero.  For the former 19-D layout, pose is mapped to
+    the first object frame and its true box-to-goal delta is mapped to the new
+    goal_obs block.  It is never copied into z.
     """
 
     if source.ndim != destination.ndim:
         return None
-    expected_delta = destination_object_dim - source_object_dim
+    source_carry_dim = source_object_dim + source_goal_dim
+    destination_carry_dim = destination_object_dim + destination_goal_dim
+    expected_delta = destination_carry_dim - source_carry_dim
     differing_axes = [
         axis
         for axis, (source_size, destination_size) in enumerate(zip(source.shape, destination.shape))
@@ -415,8 +444,8 @@ def _copy_replacing_object_features(
         return None
     old_width = int(source.shape[axis])
     new_width = int(destination.shape[axis])
-    prefix_width = old_width - tail_count - source_object_dim
-    if prefix_width < 0 or prefix_width + destination_object_dim + tail_count != new_width:
+    prefix_width = old_width - tail_count - source_carry_dim
+    if prefix_width < 0 or prefix_width + destination_carry_dim + tail_count != new_width:
         return None
 
     result = destination.clone()
@@ -431,13 +460,13 @@ def _copy_replacing_object_features(
     copy_slice(0, prefix_width, 0, prefix_width)
     if zero_new_object:
         object_slice = [slice(None)] * source.ndim
-        object_slice[axis] = slice(prefix_width, prefix_width + destination_object_dim)
+        object_slice[axis] = slice(prefix_width, prefix_width + destination_carry_dim)
         result[tuple(object_slice)] = 0.0
     if tail_count:
         copy_slice(
-            prefix_width + destination_object_dim,
+            prefix_width + destination_carry_dim,
             new_width,
-            prefix_width + source_object_dim,
+            prefix_width + source_carry_dim,
             old_width,
         )
 
@@ -445,28 +474,52 @@ def _copy_replacing_object_features(
     # rel_lin_vel(3), rel_ang_vel(3), goal_delta(3)].
     if map_legacy_pose and source_object_dim == 19 and destination_object_dim >= 9:
         copy_slice(prefix_width, prefix_width + 9, prefix_width + 1, prefix_width + 10)
-    if (
-        map_legacy_goal_to_task
-        and source_object_dim == 19
-        and task_latent_dim == 3
-        and tail_count >= task_latent_dim
-    ):
-        copy_slice(new_width - task_latent_dim, new_width, prefix_width + 16, prefix_width + 19)
+    elif source_object_dim > 0 and destination_object_dim > 0:
+        copied_object_dim = min(source_object_dim, destination_object_dim)
+        copy_slice(
+            prefix_width,
+            prefix_width + copied_object_dim,
+            prefix_width,
+            prefix_width + copied_object_dim,
+        )
+    if map_legacy_goal and source_object_dim == 19 and destination_goal_dim >= 3:
+        goal_start = prefix_width + destination_object_dim
+        copy_slice(goal_start, goal_start + 3, prefix_width + 16, prefix_width + 19)
+    elif source_goal_dim > 0 and destination_goal_dim > 0:
+        copied_goal_dim = min(source_goal_dim, destination_goal_dim)
+        source_goal_start = prefix_width + source_object_dim
+        destination_goal_start = prefix_width + destination_object_dim
+        copy_slice(
+            destination_goal_start,
+            destination_goal_start + copied_goal_dim,
+            source_goal_start,
+            source_goal_start + copied_goal_dim,
+        )
     return result
 
 
 def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
     """Load compatible weights while explicitly migrating object input columns."""
     model_path = _resolve_init_model_path(init_from)
+    source_task_latent_dim = _source_task_latent_dim(model_path)
+    if source_task_latent_dim > 0:
+        raise ValueError(
+            "--init-from points to a legacy carry checkpoint whose z tail was overwritten by task_command; "
+            "those weights are inference-only. Initialize this training run from the original locomotion checkpoint."
+        )
     source_state = safetensors.torch.load_file(model_path, device="cpu")
     destination_state = agent._model.state_dict()
     object_space = getattr(agent.obs_space, "spaces", {}).get("object_obs")
+    goal_space = getattr(agent.obs_space, "spaces", {}).get("goal_obs")
     object_dim = int(object_space.shape[0]) if object_space is not None else 0
+    goal_dim = int(goal_space.shape[0]) if goal_space is not None else 0
     if object_dim <= 0:
         raise ValueError("--init-from weight migration is intended for a model with object_obs")
+    if goal_dim <= 0:
+        raise ValueError("--init-from carry weight migration requires an explicit goal_obs")
 
     source_object_dim = _source_object_observation_dim(model_path)
-    task_latent_dim = int(getattr(agent.cfg.model, "task_latent_dim", 0))
+    source_goal_dim = _source_observation_dim(model_path, "goal_obs")
     migrated: dict[str, torch.Tensor] = {}
     exact_count = 0
     expanded_count = 0
@@ -487,6 +540,8 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
             tail_count = int(agent.action_dim)
         elif ".embed_s.0.mlp." in key:
             tail_count = 0
+        elif ("_backward_map.net.0.weight" in key) or ("_target_backward_map.net.0.weight" in key):
+            tail_count = 0
         else:
             incompatible.append(key)
             continue
@@ -495,11 +550,12 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
             destination,
             source_object_dim=source_object_dim,
             destination_object_dim=object_dim,
+            source_goal_dim=source_goal_dim,
+            destination_goal_dim=goal_dim,
             tail_count=tail_count,
-            zero_new_object=key.endswith("mlp.1.weight"),
+            zero_new_object=True,
             map_legacy_pose=key.endswith("mlp.1.weight"),
-            map_legacy_goal_to_task=".embed_z.0.mlp." in key and key.endswith("mlp.1.weight"),
-            task_latent_dim=task_latent_dim,
+            map_legacy_goal=key.endswith("mlp.1.weight"),
         )
         if expanded is None:
             incompatible.append(key)
@@ -516,6 +572,7 @@ def _initialize_agent_weights_only(agent, init_from: str | Path) -> None:
     print(
         "[INFO] Initialized model weights only: "
         f"source={model_path}, source_object_dim={source_object_dim}, destination_object_dim={object_dim}, "
+        f"source_goal_dim={source_goal_dim}, destination_goal_dim={goal_dim}, "
         f"exact_tensors={exact_count}, migrated_object_input_tensors={expanded_count}, "
         f"new_tensors={len(missing)}; optimizer/replay/train counters were not loaded",
         flush=True,
@@ -540,6 +597,15 @@ def create_agent_or_load_checkpoint(work_dir: Path, cfg: TrainConfig, agent_buil
         agent = cfg.agent.build(**agent_build_kwargs)
         if cfg.init_from is not None:
             _initialize_agent_weights_only(agent, cfg.init_from)
+    if bool(getattr(getattr(cfg.env, "carry_box", None), "enabled", False)):
+        legacy_task_dim = int(getattr(agent.cfg.model, "task_latent_dim", 0))
+        observation_spaces = getattr(agent.obs_space, "spaces", {})
+        if legacy_task_dim > 0 or "goal_obs" not in observation_spaces:
+            raise ValueError(
+                "This carry checkpoint uses the deprecated z-tail task command and is inference-only. "
+                "Start a new work directory with --init-from pointing to the original locomotion checkpoint; "
+                "do not resume or initialize formal training from the legacy carry checkpoint."
+            )
     return agent, cfg, checkpoint_status
 
 
@@ -1159,8 +1225,6 @@ class Workspace:
 
                 with profiler.stage("rollout_context", cuda=True):
                     context = self.agent.maybe_update_rollout_context(z=context, step_count=step_count, replay_buffer=replay_buffer)
-                    if context is not None:
-                        context = self.agent._model.condition_task_latent(context, obs)
                 if local_time < self.cfg.num_seed_steps:
                     if gpu_native_rollout:
                         action = native_action_low + torch.rand_like(native_action_low) * (native_action_high - native_action_low)

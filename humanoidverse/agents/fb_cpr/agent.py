@@ -150,7 +150,7 @@ class FBcprAgent(FBAgent):
             perm = torch.randperm(self.cfg.train.batch_size, device=self.device)
             z = torch.where(mix_idxs == 1, expert_encodings[perm], z)
 
-        return self._model.condition_task_latent(z, train_goal)
+        return z
 
     @torch.no_grad()
     def encode_expert(
@@ -167,8 +167,12 @@ class FBcprAgent(FBAgent):
             )  # N x L x d
             z_expert = B_expert.mean(dim=1)  # N x d
             z_expert = self._model.project_z(z_expert)
-            z_expert = torch.repeat_interleave(z_expert, self.cfg.model.seq_length, dim=0)  # batch x d
-        return self._model.condition_task_latent(z_expert, next_obs)
+            z_expert = torch.repeat_interleave(
+                z_expert,
+                self.cfg.model.seq_length,
+                dim=0,
+            )  # batch x d
+        return z_expert
 
     @torch.no_grad()
     def _balanced_discriminator_batch(
@@ -250,7 +254,6 @@ class FBcprAgent(FBAgent):
         torch.compiler.cudagraph_mark_step_begin()
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device)
-        train_z = self._model.condition_task_latent(train_z, train_obs)
 
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
@@ -268,7 +271,6 @@ class FBcprAgent(FBAgent):
         if self.cfg.train.relabel_ratio is not None:
             mask = torch.rand((self.cfg.train.batch_size, 1), device=self.device) <= self.cfg.train.relabel_ratio
             train_z = torch.where(mask, z, train_z)
-        train_z = self._model.condition_task_latent(train_z, train_obs)
 
         q_loss_coef = self.cfg.train.q_loss_coef if self.cfg.train.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.train.clip_grad_norm if self.cfg.train.clip_grad_norm > 0 else None

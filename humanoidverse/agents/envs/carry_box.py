@@ -31,8 +31,13 @@ DEFAULT_LARGEBOX_COLLISION_CENTER = tuple(
     value * scale for value, scale in zip(_SOURCE_LARGEBOX_COLLISION_CENTER, DEFAULT_LARGEBOX_MESH_SCALE)
 )
 OBJECT_FRAME_DIM = 12
-OBJECT_HISTORY_STEPS = 4
+# Robot style history contains the current frame plus four previous frames.
+# Keep the object branch on the same five-frame horizon.
+OBJECT_HISTORY_STEPS = 5
 OBJECT_OBS_DIM = OBJECT_FRAME_DIM * OBJECT_HISTORY_STEPS
+GOAL_OBS_DIM = 3
+# Kept only for loading pre-goal_obs checkpoints.  New training must not embed
+# this command in the tail of the FB latent.
 TASK_COMMAND_DIM = 3
 CARRY_STAGE_INACTIVE = 0
 CARRY_STAGE_APPROACH = 1
@@ -43,12 +48,44 @@ CARRY_STAGE_COUNT = 5
 CARRY_STAGE_NAMES = ("inactive", "approach", "pickup", "transport", "place")
 
 
+def assert_native_reference_geometry(records) -> None:
+    """Reject object trajectories produced by the obsolete resize pipeline.
+
+    ``sanitize_carry_box_data.py`` recorded ``object_geometry_retarget`` after
+    changing both the mesh proxy and the grounded trajectory.  Those files are
+    not interchangeable with the already-retargeted source PKL used by live
+    reference playback.
+    """
+
+    rejected: list[str] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or "object_valid" not in record:
+            continue
+        metadata = record.get("metadata") or {}
+        if metadata.get("object_geometry_retarget") is not None:
+            rejected.append(str(record.get("motion_key", metadata.get("motion_key", index))))
+    if rejected:
+        preview = ", ".join(rejected[:5])
+        raise ValueError(
+            "carry_box training requires native, unscaled object trajectories; "
+            f"found obsolete object_geometry_retarget metadata in {len(rejected)} motion(s): {preview}. "
+            "Use g1_largebox_full_ufo.pkl / g1_largebox_train_near10s_ufo.pkl, not a g1fit dataset."
+        )
+
+
 class CarryBoxConfig(BaseConfig):
     """Configuration isolated behind ``enabled`` so legacy environments stay unchanged."""
 
     name: Literal["CarryBoxConfig"] = "CarryBoxConfig"
     enabled: bool = False
-    require_safe_reset_mask: bool = True
+    # The checked-in source trajectories already contain the retargeted box
+    # pose at the source OBJ's physical scale.  Reject the historical g1fit
+    # files which resized the box and shifted grounded object trajectories a
+    # second time.
+    require_native_reference_geometry: bool = True
+    # Certified RSI remains available as an explicit experiment, but it must
+    # never turn itself on when an older serialized config is loaded.
+    require_safe_reset_mask: bool = False
     fail_fast_diagnostics: bool = False
     diagnostic_max_object_linear_speed: float = 20.0
     diagnostic_max_object_angular_speed: float = 100.0
@@ -84,12 +121,20 @@ class CarryBoxConfig(BaseConfig):
     place_height_tolerance: float = 0.12
     linear_speed_limit: float = 3.0
     angular_speed_limit: float = 6.0
+    # New carry policies use current + four past object frames, matching the
+    # robot temporal branch.  Inference entrypoints override this from the
+    # checkpoint observation shape for older 48-D/four-frame policies.
+    object_history_steps: int = OBJECT_HISTORY_STEPS
     # TokenHSI-style reference-state initialization.  The source-level data
     # mix already supplies locomotion examples, so these probabilities are
     # normalized over object-bearing approach/pickup/transport/place frames.
-    stage_reset_curriculum: bool = True
+    stage_reset_curriculum: bool = False
     stage_reset_probabilities: tuple[float, float, float, float] = (0.10, 0.20, 0.50, 0.20)
     upright_success_degrees: float = 30.0
+    # Inference-only compatibility for checkpoints which used task_command to
+    # overwrite z[-3:].  New checkpoints leave this disabled and consume
+    # goal_obs as an ordinary state-dependent observation instead.
+    emit_legacy_task_command: bool = False
 
     @pydantic.field_validator(
         "half_extents",
@@ -136,6 +181,8 @@ class CarryBoxConfig(BaseConfig):
             raise ValueError("stage_reset_probabilities must be non-negative")
         if sum(float(value) for value in self.stage_reset_probabilities) <= 0.0:
             raise ValueError("stage_reset_probabilities must sum to a positive value")
+        if int(self.object_history_steps) <= 0:
+            raise ValueError("object_history_steps must be positive")
         return self
 
 
@@ -264,6 +311,31 @@ def object_observation(
     return observation * mask
 
 
+def carry_goal_observation(
+    *,
+    base_quat_xyzw: torch.Tensor,
+    object_pos: torch.Tensor,
+    goal_pos: torch.Tensor,
+    valid: torch.Tensor,
+    cfg: CarryBoxConfig,
+) -> torch.Tensor:
+    """Encode the desired box displacement in the robot heading frame.
+
+    Unlike an FB latent, this value is allowed to change with state.  Keeping
+    it as a separate observation makes Bellman targets use the command from
+    the matching current/next state and leaves all 256 FB coordinates with one
+    consistent skill/reward semantics.
+    """
+
+    heading_inv = calc_heading_quat_inv(base_quat_xyzw, w_last=True)
+    goal_delta = my_quat_rotate(heading_inv, goal_pos - object_pos)
+    goal_delta = goal_delta.clamp(-cfg.position_clip, cfg.position_clip)
+    observation = goal_delta * valid.float().reshape(-1, 1)
+    if observation.shape[-1] != GOAL_OBS_DIM:
+        raise RuntimeError(f"Expected carry goal observation dim={GOAL_OBS_DIM}, got {observation.shape[-1]}")
+    return observation
+
+
 def task_latent_command(
     *,
     base_pos: torch.Tensor,
@@ -272,11 +344,10 @@ def task_latent_command(
     valid: torch.Tensor,
     cfg: CarryBoxConfig,
 ) -> torch.Tensor:
-    """Return a normalized target command that is injected into reward/task z.
+    """Return the deprecated robot-to-goal command used by old checkpoints.
 
-    This is a high-level command, not an actor observation feature.  It carries
-    the desired target relative to the robot heading while the current box pose
-    remains exclusively in ``object_obs``.
+    This exists solely so an old checkpoint can still be inspected.  New
+    training uses :func:`carry_goal_observation` and never writes into z.
     """
 
     heading_inv = calc_heading_quat_inv(base_quat_xyzw, w_last=True)

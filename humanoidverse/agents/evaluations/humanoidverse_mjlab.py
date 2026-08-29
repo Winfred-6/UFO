@@ -17,6 +17,7 @@ from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from ..buffers.trajectory import TrajectoryDictBufferMultiDim
+from ..envs.carry_box import carry_goal_observation, object_observation, temporal_object_history
 from ..envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from .base import BaseEvalConfig, extract_model
 from humanoidverse.utils.reference_observations import reference_base_ang_vel
@@ -256,6 +257,7 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
             "object_ang_vel": motion_state["object_ang_vel"],
             "object_valid": motion_state["object_valid"],
             "object_goal_pos": motion_state["object_goal_pos"],
+            "object_phase": motion_state["object_phase"],
         }
     else:
         # obs = max_local_self_obs
@@ -286,6 +288,27 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
 
     if include_last_action:
         g1env_obs["last_action"] = g1env_last_action
+
+    if bool(getattr(env, "carry_box_enabled", False)):
+        object_frames = object_observation(
+            base_pos=ref_body_pos[:, 0],
+            base_quat_xyzw=base_quat,
+            object_pos=motion_state["object_pos"],
+            object_quat_xyzw=motion_state["object_quat"],
+            valid=motion_state["object_valid"],
+            cfg=env.carry_box_cfg,
+        )
+        g1env_obs["object_obs"] = temporal_object_history(
+            object_frames,
+            history_steps=int(env.carry_box_cfg.object_history_steps),
+        )
+        g1env_obs["goal_obs"] = carry_goal_observation(
+            base_quat_xyzw=base_quat,
+            object_pos=motion_state["object_pos"],
+            goal_pos=motion_state["object_goal_pos"],
+            valid=motion_state["object_valid"],
+            cfg=env.carry_box_cfg,
+        )
 
     return g1env_obs, ref_dict
 
@@ -424,17 +447,14 @@ def _async_tracking_worker(
     object_states_list = [None] * num_envs
     object_valid_list = [None] * num_envs
     object_goal_list = [None] * num_envs
+    object_phase_list = [None] * num_envs
     tracking_object_pos = {}
 
     # Precompute context and target states per motion
     for m_id in motion_ids:
         tracking_target, tracking_target_dict = get_backward_observation(env._env, m_id, include_last_action=env.include_last_action)
         # first z should try to reach the next state, ie 1:
-        z = model.backward_map(tree_map(lambda x: x[1:], tracking_target)).clone()
-        for step in range(z.shape[0]):
-            end_idx = min(step + 1, z.shape[0])
-            z[step] = z[step:end_idx].mean(dim=0)
-        ctx = model.project_z(z)
+        ctx = model.tracking_inference(tree_map(lambda x: x[1:], tracking_target))
         ctx_dict[m_id] = ctx
         tracking_targets[m_id] = tree_map(lambda x: x.cpu(), tracking_target)
         tracking_joint_pos[m_id] = tracking_target_dict["dof_pos"].clone()
@@ -468,6 +488,7 @@ def _async_tracking_worker(
             )
             object_valid_list[env_id] = tracking_target_dict["object_valid"][0]
             object_goal_list[env_id] = tracking_target_dict["object_goal_pos"][0]
+            object_phase_list[env_id] = tracking_target_dict["object_phase"][0]
             # target_xpos_dict[env_id] = tracking_target_dict["ref_body_pos"][:, : len(xpos_bodies)]
 
     # this is for environments that are not initialized
@@ -483,6 +504,8 @@ def _async_tracking_worker(
             object_valid_list[i] = torch.zeros(1, device=core_env.device)
         if object_goal_list[i] is None:
             object_goal_list[i] = torch.zeros(3, device=core_env.device)
+        if object_phase_list[i] is None:
+            object_phase_list[i] = torch.zeros(1, device=core_env.device)
 
     target_states = {"dof_states": torch.stack(dof_states_list), "root_states": torch.stack(root_states_list)}
     if core_env.carry_box_enabled:
@@ -491,6 +514,7 @@ def _async_tracking_worker(
                 "object_states": torch.stack(object_states_list),
                 "object_valid": torch.stack(object_valid_list),
                 "object_goal_pos": torch.stack(object_goal_list),
+                "object_phase": torch.stack(object_phase_list),
             }
         )
 
