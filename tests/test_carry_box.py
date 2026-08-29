@@ -320,6 +320,21 @@ class CarryBoxTest(unittest.TestCase):
         self.assertIsInstance(restored.visual_up_axis, tuple)
         self.assertIsInstance(restored.hand_body_names, tuple)
 
+    def test_old_default_box_config_migrates_to_g1_fit_geometry(self) -> None:
+        legacy = {
+            "enabled": True,
+            "half_extents": [0.235577105, 0.229365065, 0.20394774],
+            "collision_center": [0.001494335, -0.000715375, 0.00575559],
+            "hand_body_names": ["left_wrist_yaw_link", "right_wrist_yaw_link"],
+        }
+
+        restored = CarryBoxConfig.model_validate(legacy)
+        current = CarryBoxConfig()
+
+        np.testing.assert_allclose(restored.half_extents, current.half_extents, atol=0.0)
+        np.testing.assert_allclose(restored.collision_center, current.collision_center, atol=0.0)
+        np.testing.assert_allclose(restored.visual_mesh_scale, (0.55, 0.55, 0.55), atol=0.0)
+
     def test_collision_bounds_match_the_visual_mesh(self) -> None:
         cfg = CarryBoxConfig()
         center, half_extents = mesh_axis_aligned_bounds(cfg.visual_mesh_path)
