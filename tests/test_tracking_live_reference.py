@@ -18,7 +18,7 @@ def _entity(*, free_qpos: list[int], joint_qpos: list[int] | None = None, mocap_
     )
 
 
-def test_tracking_playback_disables_only_staged_reset_sampling() -> None:
+def test_tracking_playback_disables_training_reset_certification() -> None:
     env_cfg = HumanoidVerseMjlabConfig(
         lafan_tail_path="motions.pkl",
         carry_box=CarryBoxConfig(enabled=True, require_safe_reset_mask=True, stage_reset_curriculum=True),
@@ -29,8 +29,9 @@ def test_tracking_playback_disables_only_staged_reset_sampling() -> None:
     assert changed
     assert playback_cfg is not env_cfg
     assert playback_cfg.carry_box.stage_reset_curriculum is False
-    assert playback_cfg.carry_box.require_safe_reset_mask is True
+    assert playback_cfg.carry_box.require_safe_reset_mask is False
     assert env_cfg.carry_box.stage_reset_curriculum is True
+    assert env_cfg.carry_box.require_safe_reset_mask is True
 
 
 def test_live_reference_writes_synchronized_robot_box_and_target() -> None:

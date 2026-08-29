@@ -394,22 +394,33 @@ def _resolve_tracking_robot_config(
 
 
 def _prepare_tracking_playback_env_cfg(env_cfg: Any) -> tuple[Any, bool]:
-    """Disable the training-only staged reset sampler for exact playback.
+    """Disable training-only reset certification for exact playback.
 
     Tracking inference resets to the explicitly selected source trajectory and
     then advances through it frame by frame.  Requiring every inference PKL to
     carry staged random-reset certification would prevent older checkpoints
     and full-resolution source data from being inspected, even though that
-    sampler is never used by the tracking rollout.  Keep the legacy certified
-    reset mask enabled for the environment's initial construction reset.
+    sampler is never used by the tracking rollout.  The environment performs a
+    temporary random reset while it is being constructed, so the ordinary safe
+    mask must be disabled here as well: with one environment it can otherwise
+    randomly choose a motion which has staged frames but no legacy ground-reset
+    frames and fail before the selected tracking motion is installed.
     """
 
     carry_box = getattr(env_cfg, "carry_box", None)
-    if not bool(getattr(carry_box, "enabled", False)) or not bool(
-        getattr(carry_box, "stage_reset_curriculum", False)
-    ):
+    if not bool(getattr(carry_box, "enabled", False)):
         return env_cfg, False
-    playback_carry_box = carry_box.model_copy(update={"stage_reset_curriculum": False})
+    needs_override = bool(getattr(carry_box, "stage_reset_curriculum", False)) or bool(
+        getattr(carry_box, "require_safe_reset_mask", False)
+    )
+    if not needs_override:
+        return env_cfg, False
+    playback_carry_box = carry_box.model_copy(
+        update={
+            "stage_reset_curriculum": False,
+            "require_safe_reset_mask": False,
+        }
+    )
     return env_cfg.model_copy(update={"carry_box": playback_carry_box}), True
 
 
@@ -472,7 +483,7 @@ def run_tracking_inference(
     if disabled_staged_reset:
         print(
             "[INFO] Tracking playback uses the source sequence directly; "
-            "disabled the training-only staged reset curriculum.",
+            "disabled training-only reset certification.",
             flush=True,
         )
     wrapped_env, _ = env_cfg.build(num_envs=1)
