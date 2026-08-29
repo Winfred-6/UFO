@@ -17,11 +17,11 @@ from humanoidverse.utils.torch_utils import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_LARGEBOX_MESH = PROJECT_ROOT / "humanoidverse/data/objects/largebox/largebox_cleaned_simplified.obj"
-# The source box (roughly 47 x 46 x 41 cm) intersects the retargeted G1 torso
-# by as much as 14 cm.  A physics scan over all 31,422 reference frames found
-# 55% to be the largest conservative uniform proxy that supplies certified
-# frames in every carry phase without admitting deep torso penetration.
-DEFAULT_LARGEBOX_MESH_SCALE = (0.55, 0.55, 0.55)
+# The retargeted object already uses the source OBJ at its physical size.
+# Collision and visualization must share this scale; rendering both was the
+# source of the apparent nested box, not an indication that the object itself
+# needed another geometry/data rescale.
+DEFAULT_LARGEBOX_MESH_SCALE = (1.0, 1.0, 1.0)
 _SOURCE_LARGEBOX_HALF_EXTENTS = (0.235577105, 0.229365065, 0.20394774)
 _SOURCE_LARGEBOX_COLLISION_CENTER = (0.001494335, -0.000715375, 0.00575559)
 DEFAULT_LARGEBOX_HALF_EXTENTS = tuple(
@@ -110,42 +110,14 @@ class CarryBoxConfig(BaseConfig):
 
     @pydantic.model_validator(mode="before")
     @classmethod
-    def _migrate_legacy_geometry(cls, value):
-        """Migrate the old unscaled default box while preserving custom boxes.
-
-        Carry checkpoints written before ``visual_mesh_scale`` existed stored
-        the source OBJ bounds directly.  Replaying one of those checkpoints
-        with the G1-fit trajectories would therefore restore the 47 cm source
-        box and render it over the smaller physical reference.  Only that
-        exact legacy default is migrated; arbitrary user-specified bounds keep
-        their original size and merely infer a matching mesh scale.
-        """
+    def _infer_legacy_visual_scale(cls, value):
+        """Match the mesh to serialized collision bounds without resizing them."""
 
         if not isinstance(value, dict) or "half_extents" not in value:
             return value
         restored = dict(value)
         half_extents = tuple(float(item) for item in restored["half_extents"])
-        collision_center = tuple(
-            float(item) for item in restored.get("collision_center", _SOURCE_LARGEBOX_COLLISION_CENTER)
-        )
-        legacy_default = (
-            "visual_mesh_scale" not in restored
-            and len(half_extents) == 3
-            and len(collision_center) == 3
-            and all(
-                abs(actual - expected) <= 1.0e-8
-                for actual, expected in zip(half_extents, _SOURCE_LARGEBOX_HALF_EXTENTS)
-            )
-            and all(
-                abs(actual - expected) <= 1.0e-8
-                for actual, expected in zip(collision_center, _SOURCE_LARGEBOX_COLLISION_CENTER)
-            )
-        )
-        if legacy_default:
-            restored["half_extents"] = DEFAULT_LARGEBOX_HALF_EXTENTS
-            restored["collision_center"] = DEFAULT_LARGEBOX_COLLISION_CENTER
-            restored["visual_mesh_scale"] = DEFAULT_LARGEBOX_MESH_SCALE
-        elif "visual_mesh_scale" not in restored and len(half_extents) == 3:
+        if "visual_mesh_scale" not in restored and len(half_extents) == 3:
             restored["visual_mesh_scale"] = tuple(
                 half / source for half, source in zip(half_extents, _SOURCE_LARGEBOX_HALF_EXTENTS)
             )

@@ -7,18 +7,21 @@
 configs/data/lafan_g1_largebox.yaml
 ```
 
-处理后的搬箱训练和推理数据已经随仓库提供：
+未缩放的搬箱训练和推理数据已经随仓库提供：
 
 ```text
-humanoidverse/data/g1_largebox_g1fit_train_near10s_ufo.pkl
-humanoidverse/data/g1_largebox_g1fit_full_ufo.pkl
+humanoidverse/data/g1_largebox_train_near10s_ufo.pkl
+humanoidverse/data/g1_largebox_full_ufo.pkl
 ```
 
 数据内部使用仓库相对路径，不依赖原始的本机 Downloads 目录。
-原始约 `47.1 × 45.9 × 40.8 cm` 的网格与 G1 重定向姿态最高穿模约 14 cm；
-`g1fit` 数据使用经过 31,422 帧真实 MJLab 动力学认证的
-`25.9 × 25.2 × 22.4 cm` 可抱持尺寸，质量仍为 `0.5 kg`。碰撞代理不可见，
-可视 OBJ 与代理尺寸严格一致，因此 play 中不会再出现一大一小两层箱子。
+参考数据已经按原始约 `47.1 × 45.9 × 40.8 cm` 的 OBJ 完成重定向，不再做
+额外几何或轨迹缩放，质量为 `0.5 kg`。碰撞代理与 OBJ 使用同一原始边界，
+但碰撞代理不可见，因此 play 中只显示一层 OBJ。
+
+> `ufo_fb_g1_carry_box_stage_rsi_v3` 使用了错误的额外 `0.55` 缩放，只保留作
+> 诊断记录，不应续训或用于判断原始搬箱数据效果。正式的原尺寸 staged-RSI
+> 训练需要重新完成接触安全认证后再启动。
 
 策略使用统一的条件式时序流程：
 
@@ -97,6 +100,13 @@ CUDA_VISIBLE_DEVICES=0 uv run python -m humanoidverse.tracking_inference --model
 
 将 `--dataset g1_largebox` 改成 `--dataset lafan`，可检查没有箱子观测时的
 普通运动路径。
+
+直接检查未缩放的原始参考数据时，使用旧原尺寸 checkpoint 并显式指定原始
+PKL；原色是策略 rollout，青色是同步原始数据：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python -m humanoidverse.tracking_inference --model-folder runs/ufo_fb_g1_carry_box_conditional_amp_v2 --data-path humanoidverse/data/g1_largebox_full_ufo.pkl --device cuda:0 --motion-list 60 --headless false --save-mp4 false --disable-dr true --disable-obs-noise true --export-onnx false --live-reference true --live-reference-offset 0 1.5 0
+```
 
 ## Reward mode 搬箱
 
