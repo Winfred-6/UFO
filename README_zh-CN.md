@@ -216,6 +216,19 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box 
 如果只需要全局合计 512 万容量，可改成 `--buffer-size 640000`，但每个
 rank 可看到的历史窗口也会相应缩短。
 
+### 安全停止与续训
+
+训练默认启用退出前 checkpoint。需要暂停时运行：
+
+```bash
+uv run python scripts/request_training_stop.py --work-dir runs/ufo_fb_g1_carry_box_minimal_v1
+```
+
+该命令会等待一个完整 rollout/参数更新边界，再保存模型、优化器、replay buffer
+和精确计数；看到 `Safe stop complete` 后训练进程才会退出。之后以相同训练命令和
+相同 `--work-dir` 启动即可续训。`Ctrl-C` 与 `SIGTERM` 也走相同安全保存路径；
+`SIGKILL`、断电或系统崩溃无法触发退出保存。
+
 ### Replay buffer 的内存与吞吐
 
 在线 replay 和 expert replay 的大容量存储默认放在 CPU RAM。UFO 使用

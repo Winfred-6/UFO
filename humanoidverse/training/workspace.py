@@ -5,6 +5,7 @@
 
 import json
 import os
+import signal
 import time
 import typing as tp
 from collections import defaultdict
@@ -48,6 +49,12 @@ from humanoidverse.distributed import (
     broadcast_object,
     module_sync_report,
     sync_floating_buffers,
+)
+from humanoidverse.training.safe_stop import (
+    atomic_write_json,
+    read_json_if_present,
+    safe_stop_request_path,
+    safe_stop_status_path,
 )
 
 TRAIN_LOG_FILENAME = "train_log.txt"
@@ -124,6 +131,9 @@ class TrainConfig(BaseConfig):
     # Note: this is in env steps (multiples of online_parallel_envs)
     checkpoint_every_steps: int = 5_000_000
     checkpoint_buffer: bool = True
+    # Convert SIGINT/SIGTERM or a work-dir stop request into a checkpoint at
+    # the next complete rollout/update boundary, then exit cleanly.
+    save_on_exit: bool = True
     prioritization: bool = False
     prioritization_min_val: float = 0.5
     prioritization_max_val: float = 5
@@ -747,6 +757,145 @@ class Workspace:
         self.training_with_expert_data = True
 
         self.manager = None
+        self._safe_stop_requested_by_signal = False
+        self._safe_stop_reason: str | None = None
+        self._safe_stop_request_id: str | None = None
+
+    @contextmanager
+    def _safe_stop_signal_handlers(self):
+        """Turn process termination signals into a deferred safe-stop request."""
+
+        if not self.cfg.save_on_exit:
+            yield
+            return
+
+        previous_handlers: dict[signal.Signals, tp.Any] = {}
+
+        def request_stop(signum, _frame) -> None:
+            signal_name = signal.Signals(signum).name
+            if not self._safe_stop_requested_by_signal:
+                self._safe_stop_requested_by_signal = True
+                self._safe_stop_reason = f"signal:{signal_name}"
+                self._safe_stop_request_id = f"signal-{signal_name}-{time.time_ns()}"
+                if self._write_shared_artifacts:
+                    print(
+                        f"[INFO] Safe stop requested by {signal_name}; "
+                        "checkpointing after the current complete update boundary.",
+                        flush=True,
+                    )
+
+        try:
+            for stop_signal in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[stop_signal] = signal.getsignal(stop_signal)
+                signal.signal(stop_signal, request_stop)
+            yield
+        finally:
+            for stop_signal, previous_handler in previous_handlers.items():
+                signal.signal(stop_signal, previous_handler)
+
+    def _local_safe_stop_requested(self) -> bool:
+        if not self.cfg.save_on_exit:
+            return False
+        if self._safe_stop_requested_by_signal:
+            return True
+
+        request_path = safe_stop_request_path(self.work_dir)
+        request = read_json_if_present(request_path)
+        if request is None:
+            return False
+
+        request_id = str(request.get("request_id", f"request-{request_path.stat().st_mtime_ns}"))
+        completed = read_json_if_present(safe_stop_status_path(self.work_dir))
+        if completed is not None and completed.get("request_id") == request_id:
+            # A previous process saved this request but exited between writing
+            # its completion marker and consuming the request file.
+            request_path.unlink(missing_ok=True)
+            return False
+
+        self._safe_stop_request_id = request_id
+        self._safe_stop_reason = str(request.get("reason", "work-dir safe-stop request"))
+        return True
+
+    def _safe_stop_requested_across_ranks(self) -> bool:
+        requested = self._local_safe_stop_requested()
+        if not self.cfg.distributed_sync or self.distributed_world_size <= 1:
+            return requested
+
+        import torch.distributed as dist
+
+        requested_tensor = torch.tensor(
+            [int(requested)],
+            dtype=torch.int32,
+            device=self.agent.device,
+        )
+        dist.all_reduce(requested_tensor, op=dist.ReduceOp.MAX)
+        requested = bool(requested_tensor.item())
+        if requested and self._safe_stop_reason is None:
+            self._safe_stop_reason = "request received by another distributed rank"
+            self._safe_stop_request_id = f"distributed-{time.time_ns()}"
+        return requested
+
+    def _save_and_stop_if_requested(
+        self,
+        *,
+        local_time: int,
+        global_time: int,
+        optimizer_steps: int,
+        replay_buffer: Dict[str, tp.Any],
+        last_saved_global_time: int,
+    ) -> tuple[bool, int]:
+        """Checkpoint a synchronized training boundary and report whether to exit."""
+
+        if not self._safe_stop_requested_across_ranks():
+            return False, last_saved_global_time
+        if global_time < last_saved_global_time:
+            raise RuntimeError(
+                f"Safe-stop time regressed from saved={last_saved_global_time} to current={global_time}"
+            )
+
+        checkpoint_reused = global_time == last_saved_global_time
+        if self._write_shared_artifacts:
+            action = "using the checkpoint already written" if checkpoint_reused else "writing a final checkpoint"
+            print(
+                f"[INFO] Safe stop at local_time={local_time} global_time={global_time} "
+                f"optimizer_steps={optimizer_steps}: {action}.",
+                flush=True,
+            )
+        if not checkpoint_reused:
+            self.save(
+                local_time=local_time,
+                global_time=global_time,
+                optimizer_steps=optimizer_steps,
+                replay_buffer=replay_buffer,
+            )
+            last_saved_global_time = global_time
+
+        self._checkpoint_local_time = int(local_time)
+        self._checkpoint_global_time = int(global_time)
+        if self._write_shared_artifacts:
+            request_id = self._safe_stop_request_id or f"safe-stop-{time.time_ns()}"
+            atomic_write_json(
+                safe_stop_status_path(self.work_dir),
+                {
+                    "status": "saved_and_stopped",
+                    "request_id": request_id,
+                    "reason": self._safe_stop_reason or "safe-stop request",
+                    "completed_at_unix": time.time(),
+                    "local_time": int(local_time),
+                    "global_time": int(global_time),
+                    "optimizer_steps": int(optimizer_steps),
+                    "checkpoint_reused": bool(checkpoint_reused),
+                    "checkpoint_dir": str((self.work_dir / CHECKPOINT_DIR_NAME).resolve()),
+                },
+            )
+            safe_stop_request_path(self.work_dir).unlink(missing_ok=True)
+            print(
+                f"[INFO] Safe-stop checkpoint complete at global_time={global_time}; exiting training cleanly.",
+                flush=True,
+            )
+        if self.cfg.distributed_sync and self.distributed_world_size > 1:
+            barrier()
+        return True, last_saved_global_time
 
     def _checkpoint_buffer_path(self, checkpoint_dir: Path) -> Path:
         if self.cfg.checkpoint_rank_buffers and self.distributed_world_size > 1:
@@ -755,7 +904,8 @@ class Workspace:
 
     def train(self):
         self.start_time = time.time()
-        self.train_online()
+        with self._safe_stop_signal_handlers():
+            self.train_online()
 
     def _get_torso_contact_force_metrics(self, train_env) -> dict[str, float]:
         if not self.cfg.log_torso_contact_forces:
@@ -936,6 +1086,7 @@ class Workspace:
         start_time = time.time()
         fps_start_time = time.time()
         checkpoint_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.checkpoint_every_steps)
+        last_saved_global_time = self._checkpoint_global_time
         eval_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.eval_every_steps)
         update_agent_time_checker = EveryNStepsChecker(self._checkpoint_local_time, self.cfg.update_agent_every)
         log_time_checker = EveryNStepsChecker(self._checkpoint_global_time, self.cfg.log_every_updates)
@@ -953,6 +1104,17 @@ class Workspace:
             if (local_time != self._checkpoint_local_time) and checkpoint_time_checker.check(global_time):
                 checkpoint_time_checker.update_last_step(global_time)
                 self.save(local_time=local_time, global_time=global_time, optimizer_steps=self._optimizer_steps, replay_buffer=replay_buffer)
+                last_saved_global_time = global_time
+
+            should_stop, last_saved_global_time = self._save_and_stop_if_requested(
+                local_time=local_time,
+                global_time=global_time,
+                optimizer_steps=self._optimizer_steps,
+                replay_buffer=replay_buffer,
+                last_saved_global_time=last_saved_global_time,
+            )
+            if should_stop:
+                break
 
             if global_time >= self.cfg.num_env_steps:
                 break
@@ -1047,6 +1209,16 @@ class Workspace:
                     replay_buffer["expert_slicer"].update_priorities(
                         priorities=priorities.to(self.cfg.buffer_device), idxs=torch.tensor(np.array(idxs), device=self.cfg.buffer_device)
                     )
+
+            should_stop, last_saved_global_time = self._save_and_stop_if_requested(
+                local_time=local_time,
+                global_time=global_time,
+                optimizer_steps=self._optimizer_steps,
+                replay_buffer=replay_buffer,
+                last_saved_global_time=last_saved_global_time,
+            )
+            if should_stop:
+                break
 
             if global_time + global_step_increment > self.cfg.num_env_steps:
                 if self._write_shared_artifacts:
@@ -1357,6 +1529,16 @@ class Workspace:
             else:
                 done = np.logical_or(new_terminated.ravel(), new_truncated.ravel())
             info = new_info
+
+            should_stop, last_saved_global_time = self._save_and_stop_if_requested(
+                local_time=next_local_time,
+                global_time=next_global_time,
+                optimizer_steps=self._optimizer_steps,
+                replay_buffer=replay_buffer,
+                last_saved_global_time=last_saved_global_time,
+            )
+            if should_stop:
+                break
         for buffer in replay_buffer.values():
             close = getattr(buffer, "close", None)
             if close is not None:

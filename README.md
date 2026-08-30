@@ -206,6 +206,19 @@ Core defaults live in `humanoidverse/train.py`. `--num-envs` and `--buffer-size`
 are per training rank (normally one rank per GPU), while `--num-env-steps` is
 the global sample budget.
 
+Training enables checkpoint-before-exit by default. To pause a run without
+discarding updates since the periodic checkpoint, use:
+
+```bash
+uv run python scripts/request_training_stop.py --work-dir runs/ufo_fb_g1_carry_box_minimal_v1
+```
+
+The command waits for a complete rollout/update boundary, then saves the model,
+optimizer, replay buffer, and exact counters before the trainer exits. Relaunch
+the same training command with the same work directory to resume. `Ctrl-C` and
+`SIGTERM` use the same safe path; `SIGKILL` and power loss cannot run an exit
+checkpoint.
+
 ### Replay-buffer memory and throughput
 
 The large online and expert replay stores default to CPU RAM. UFO uses

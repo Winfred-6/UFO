@@ -48,6 +48,21 @@ work-dir 中续训此前带 `goal_obs`、z 尾部命令或专用判别器的 che
 
 性能确认后可将 `--runtime-timing-every 25` 改为 `0`。
 
+### 安全停止与续训
+
+训练默认启用 `--save-on-exit`。需要暂停时不要直接杀进程，运行：
+
+```bash
+uv run python scripts/request_training_stop.py --work-dir runs/ufo_fb_g1_carry_box_minimal_v1
+```
+
+命令会等待当前完整训练更新结束，保存模型、优化器、replay buffer 和精确训练计数，
+看到 `Safe stop complete` 后训练进程会正常退出。以后用相同训练命令和相同
+`--work-dir` 启动即可从该 checkpoint 继续；已有 checkpoint 时 `--init-from` 不会
+重新覆盖续训状态。`Ctrl-C` 和 `SIGTERM` 也会触发同一流程，但上述命令能明确等待
+保存确认。`SIGKILL`、断电和机器崩溃无法触发退出保存，只能恢复最近一次已落盘的
+checkpoint。
+
 ## 八卡 H200
 
 先运行 smoke：

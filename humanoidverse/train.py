@@ -148,6 +148,7 @@ def build_ufo_mjlab_config(
     task: str = "motion",
     init_from: str | Path | None = None,
     fail_fast_diagnostics: bool = False,
+    save_on_exit: bool = True,
 ) -> TrainConfig:
     agent = canonical_agent_name(agent)
     carry_box_enabled = task == "carry_box"
@@ -264,6 +265,7 @@ def build_ufo_mjlab_config(
         num_agent_updates=train_runtime["num_agent_updates"],
         checkpoint_every_steps=checkpoint_every_steps,
         checkpoint_buffer=train_runtime["checkpoint_buffer"],
+        save_on_exit=bool(save_on_exit),
         prioritization=run_eval_and_prioritization,
         prioritization_min_val=0.5,
         prioritization_max_val=2.0,
@@ -388,6 +390,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         task=args.task,
         init_from=args.init_from,
         fail_fast_diagnostics=bool(args.fail_fast_diagnostics),
+        save_on_exit=bool(args.save_on_exit),
     )
     print(
         "[INFO] UFO train: "
@@ -402,7 +405,7 @@ def run_train(args: argparse.Namespace, log_dir: Path) -> None:
         f"cartwheel_aux_safe={args.cartwheel_aux_safe}, lr_scale={args.lr_scale}, clip_grad_norm={args.clip_grad_norm}, "
         f"disable_dr={cfg.env.disable_domain_randomization}, disable_obs_noise={cfg.env.disable_obs_noise}, "
         f"init_from={cfg.init_from}, carry_box_mass_kg={cfg.env.carry_box.mass_kg if cfg.env.carry_box.enabled else None}, "
-        f"fail_fast_diagnostics={args.fail_fast_diagnostics}, compile={cfg.agent.compile}",
+        f"fail_fast_diagnostics={args.fail_fast_diagnostics}, save_on_exit={cfg.save_on_exit}, compile={cfg.agent.compile}",
         flush=True,
     )
     try:
@@ -506,6 +509,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=DEFAULT_NUM_ENVS)
     parser.add_argument("--num-env-steps", type=int, default=DEFAULT_NUM_ENV_STEPS)
     parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY_STEPS)
+    parser.add_argument(
+        "--save-on-exit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On SIGINT/SIGTERM or a work-directory safe-stop request, checkpoint at the next "
+            "complete training-update boundary before exiting."
+        ),
+    )
     parser.add_argument(
         "--data-path",
         nargs="+",

@@ -154,6 +154,20 @@ The timing output reports `env_step_gpu_ms`, `cpu_copy_ms`, `replay_extend_ms`,
 overall agent-update time. Set `--runtime-timing-every 0` after profiling for
 the lowest possible synchronization overhead.
 
+### Safe stop and resume
+
+Checkpoint-before-exit is enabled by default. Request a pause with:
+
+```bash
+uv run python scripts/request_training_stop.py --work-dir runs/ufo_fb_g1_carry_box_minimal_v1
+```
+
+The request waits for a complete training-update boundary and saves the model,
+optimizer, replay buffer, and exact counters before exit. Start the same command
+with the same work directory to resume. `Ctrl-C` and `SIGTERM` trigger the same
+path. An uncatchable `SIGKILL` or power loss can only recover the most recent
+checkpoint already on disk.
+
 ## TeCH Training
 
 ```bash
