@@ -146,10 +146,11 @@ TeCH 在早期 UFO 版本中曾经叫 TLDR。`--agent tldr` 仍然保留为 `--a
 本机 Downloads 路径。箱子是 MJLab 中的 500 g 自由刚体，并带有可视化
 目标框。
 
-actor 只接收箱子相对位置、6D 旋转、尺寸的 4 帧窗口；当前箱子状态仍不进入
-Backward/z 编码器。单个门控时序 discriminator 在 walk 模式只判机器人，
-在 carry 模式联合判别人箱同步，并使用错配箱子负样本。目标位置写入 reward/task
-z 的保留尾部，支持拾取、搬运、放置与掉落重捡而不向 actor 暴露接触标志。
+搬箱扩展保持原始 UFO 网络语义：actor、F、B、critic、aux critic 和原始
+z-conditioned discriminator 仅额外读取 `object_obs`。它包含箱子相对位置、6D
+旋转、尺寸的当前帧与四帧历史；无箱子的 LaFAN 数据对应全零窗口。接触状态与目标
+位置不进入策略观测，完整 256 维 z 不做覆盖，也不增加 task command、目标分支或
+专用判别器。接近、拿起、搬运、放置和恢复使用原有 auxiliary reward 机制。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -159,7 +160,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --gpu-ids all \
   --num-envs 1024 \
   --num-env-steps 192000000 \
-  --work-dir runs/ufo_fb_g1_carry_box \
+  --work-dir runs/ufo_fb_g1_carry_box_minimal_v1 \
+  --data-manifest configs/data/lafan_g1_largebox.yaml \
   --init-from runs/ufo_fb_g1/checkpoint \
   --update-z-every-step 100 \
   --buffer-size 5120000
@@ -170,39 +172,40 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 uv run python -m humanoidverse.tracking_inference \
-  --model-folder runs/ufo_fb_g1_carry_box \
-  --data-manifest configs/data/lafan_g1_largebox.yaml \
-  --dataset g1_largebox \
-  --motion-list 0 \
+  --model-folder runs/ufo_fb_g1_carry_box_minimal_v1 \
+  --data-path humanoidverse/data/g1_largebox_full_ufo.pkl \
+  --motion-list 60 \
   --device cuda:0 \
   --headless false \
   --save-mp4 false \
   --export-onnx false \
   --disable-dr true \
-  --disable-obs-noise true
+  --disable-obs-noise true \
+  --live-reference true \
+  --live-reference-offset 0 1.5 0
 ```
 
-把 `--dataset g1_largebox` 改成 `--dataset lafan` 即可测试“不给箱子
-观测”的普通动作路径，此时 19 维箱子观测严格为全零。
+原色是策略，青色是逐帧同步的原始机器人和箱体；需要重叠观察时，把
+`--live-reference-offset` 改成 `0 0 0`。
 
 单张 32 GiB RTX 5090 建议保持 1024 个环境，并使用 CPU replay、后台
 预取和 GPU-native rollout：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
+CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_minimal_v1 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
 ```
 
 八张 H200 可以把每个 rank 的 replay 直接放在对应 GPU，去掉 CPU
 拷贝和预取线程：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_minimal_v1_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
 ```
 
 smoke 确认日志中出现 `rank=0/8` 到 `rank=7/8` 后，再启动正式训练：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_minimal_v1_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
 ```
 
 这里的 `--buffer-size` 是每卡容量。八卡稳定配置默认关闭分布式

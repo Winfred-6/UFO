@@ -157,7 +157,6 @@ class PolicyExporterLSTM(torch.nn.Module):
 
 def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, velocity_multiplier: float = 1.0) -> torch.Tensor:
     from humanoidverse.agents.envs.carry_box import (
-        carry_goal_observation,
         object_observation,
         temporal_object_history,
     )
@@ -255,13 +254,6 @@ def get_backward_observation(env, motion_id, use_root_height_obs: bool = False, 
                 object_frames,
                 history_steps=int(env.carry_box_cfg.object_history_steps),
             )
-            ufo_obs["goal_obs"] = carry_goal_observation(
-                base_quat_xyzw=base_quat,
-                object_pos=motion_state["object_pos"],
-                goal_pos=motion_state["object_goal_pos"],
-                valid=motion_state["object_valid"],
-                cfg=env.carry_box_cfg,
-            )
         return ufo_obs, ref_dict
     else:
         ref_dict = {
@@ -275,9 +267,6 @@ _SUPPORTED_POLICY_ACTOR_INPUT_KEYS = (
     "last_action",
     "history_actor",
     "object_obs",
-    "goal_obs",
-    # Inference-only support for checkpoints predating goal_obs.
-    "task_command",
 )
 
 
@@ -359,12 +348,6 @@ def _policy_output_action_dim(inference_model: nn.Module) -> int:
 def _infer_policy_onnx_export_spec(inference_model: nn.Module, z_dim: int) -> dict[str, Any]:
     actor_filter_input_keys = _get_policy_actor_input_keys(inference_model)
     actor_input_keys = list(actor_filter_input_keys)
-    legacy_task_dim = int(getattr(getattr(inference_model, "cfg", None), "task_latent_dim", 0))
-    legacy_task_key = getattr(getattr(inference_model, "cfg", None), "task_latent_key", None)
-    if legacy_task_dim > 0 and legacy_task_key not in actor_input_keys:
-        if not isinstance(legacy_task_key, str):
-            raise ValueError("Legacy task_latent_dim requires a string task_latent_key for ONNX export")
-        actor_input_keys.append(legacy_task_key)
     actor_input_dims = _actor_input_dims_from_obs_space(inference_model, actor_input_keys)
     actor_input_dim = sum(actor_input_dims.values())
     actor_filter_input_dim = sum(actor_input_dims[key] for key in actor_filter_input_keys)

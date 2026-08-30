@@ -18,41 +18,22 @@ def _entity(*, free_qpos: list[int], joint_qpos: list[int] | None = None, mocap_
     )
 
 
-def test_tracking_playback_disables_training_reset_certification() -> None:
-    env_cfg = HumanoidVerseMjlabConfig(
-        lafan_tail_path="motions.pkl",
-        carry_box=CarryBoxConfig(enabled=True, require_safe_reset_mask=True, stage_reset_curriculum=True),
-    )
-
-    playback_cfg, changed = _prepare_tracking_playback_env_cfg(env_cfg)
-
-    assert changed
-    assert playback_cfg is not env_cfg
-    assert playback_cfg.carry_box.stage_reset_curriculum is False
-    assert playback_cfg.carry_box.require_safe_reset_mask is False
-    assert env_cfg.carry_box.stage_reset_curriculum is True
-    assert env_cfg.carry_box.require_safe_reset_mask is True
-
-
-def test_tracking_playback_restores_legacy_object_width_and_task_adapter() -> None:
+def test_tracking_playback_restores_checkpoint_object_history_width() -> None:
     env_cfg = HumanoidVerseMjlabConfig(
         lafan_tail_path="motions.pkl",
         carry_box=CarryBoxConfig(enabled=True),
     )
-    legacy_model = SimpleNamespace(
+    model = SimpleNamespace(
         obs_space=SimpleNamespace(
             spaces={"object_obs": SimpleNamespace(shape=(48,))},
         ),
-        cfg=SimpleNamespace(task_latent_dim=3),
     )
 
-    playback_cfg, changed = _prepare_tracking_playback_env_cfg(env_cfg, model=legacy_model)
+    playback_cfg, changed = _prepare_tracking_playback_env_cfg(env_cfg, model=model)
 
     assert changed
     assert playback_cfg.carry_box.object_history_steps == 4
-    assert playback_cfg.carry_box.emit_legacy_task_command is True
     assert env_cfg.carry_box.object_history_steps == 5
-    assert env_cfg.carry_box.emit_legacy_task_command is False
 
 
 def test_live_reference_writes_synchronized_robot_box_and_target() -> None:

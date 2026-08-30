@@ -8,16 +8,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import mujoco
-from gymnasium import spaces
 
 from humanoidverse.agents.buffers.trajectory import TrajectoryDictBuffer
 from humanoidverse.agents.envs.carry_box import (
     OBJECT_FRAME_DIM,
-    OBJECT_HISTORY_STEPS,
     OBJECT_OBS_DIM,
     CarryBoxConfig,
     assert_native_reference_geometry,
-    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     make_carry_box_spec,
@@ -25,20 +22,18 @@ from humanoidverse.agents.envs.carry_box import (
     parked_box_local_position,
     temporal_object_history,
 )
-from humanoidverse.agents.nn_models import ConditionalTemporalDiscriminatorArchiConfig
 from humanoidverse.agents.presets.fb import build_fb_agent
 from humanoidverse.mjlab_reward_relabel import RewardWrapperHV
-from humanoidverse.training.workspace import _copy_replacing_object_features, _copy_with_inserted_features
+from humanoidverse.training.workspace import _copy_with_inserted_features
 from humanoidverse.utils.motion_data.object_physics import (
     classify_carry_stages,
     mesh_axis_aligned_bounds,
     oriented_box_min_corner_z,
-    retarget_object_collision_geometry,
     sanitize_object_ground_trajectory,
 )
 from humanoidverse.utils.motion_data.paired_object_csv import load_paired_hhtools_csv
 from humanoidverse.utils.motion_data.schema import validate_ufo_motion_dict
-from humanoidverse.utils.motion_lib.motion_lib_base import MotionLibBase, _optional_object_state_from_motion_file
+from humanoidverse.utils.motion_lib.motion_lib_base import _optional_object_state_from_motion_file
 from humanoidverse.utils.robot_spec import load_robot_spec
 
 
@@ -181,18 +176,6 @@ class CarryBoxTest(unittest.TestCase):
         torch.testing.assert_close(history[0, :OBJECT_FRAME_DIM], frame[0])
         torch.testing.assert_close(history[0, OBJECT_FRAME_DIM:], torch.zeros(OBJECT_OBS_DIM - OBJECT_FRAME_DIM))
 
-    def test_target_is_a_separate_box_to_goal_observation(self) -> None:
-        identity = torch.tensor([[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]])
-        command = carry_goal_observation(
-            base_quat_xyzw=identity,
-            object_pos=torch.tensor([[1.0, 2.0, 3.0], [9.0, 9.0, 9.0]]),
-            goal_pos=torch.tensor([[2.5, -1.0, 4.0], [1.0, 1.0, 1.0]]),
-            valid=torch.tensor([[1.0], [0.0]]),
-            cfg=CarryBoxConfig(),
-        )
-        torch.testing.assert_close(command[0], torch.tensor([1.5, -3.0, 1.0]))
-        torch.testing.assert_close(command[1], torch.zeros(3))
-
     def test_large_box_approach_distance_uses_surface_not_center(self) -> None:
         cfg = CarryBoxConfig(half_extents=(1.0, 0.5, 0.25), collision_center=(0.0, 0.0, 0.0))
         distance, opposition = hand_box_surface_geometry(
@@ -333,8 +316,6 @@ class CarryBoxTest(unittest.TestCase):
         np.testing.assert_allclose(restored.half_extents, legacy["half_extents"], atol=0.0)
         np.testing.assert_allclose(restored.collision_center, legacy["collision_center"], atol=0.0)
         np.testing.assert_allclose(restored.visual_mesh_scale, (1.0, 1.0, 1.0), atol=0.0)
-        self.assertFalse(restored.require_safe_reset_mask)
-        self.assertFalse(restored.stage_reset_curriculum)
 
     def test_formal_training_rejects_resized_reference_metadata(self) -> None:
         records = [
@@ -352,23 +333,6 @@ class CarryBoxTest(unittest.TestCase):
         center, half_extents = mesh_axis_aligned_bounds(cfg.visual_mesh_path)
         np.testing.assert_allclose(center * cfg.visual_mesh_scale, cfg.collision_center, atol=1.0e-7)
         np.testing.assert_allclose(half_extents * cfg.visual_mesh_scale, cfg.half_extents, atol=1.0e-7)
-
-    def test_geometry_retarget_anchors_ground_but_preserves_airborne_origin(self) -> None:
-        positions = np.asarray([[0.0, 0.0, 1.0], [0.0, 0.0, 1.3]], dtype=np.float32)
-        quaternions = np.tile([0.0, 0.0, 0.0, 1.0], (2, 1)).astype(np.float32)
-        retargeted, shift = retarget_object_collision_geometry(
-            positions,
-            quaternions,
-            source_collision_center=np.zeros(3, dtype=np.float32),
-            source_half_extents=np.ones(3, dtype=np.float32),
-            target_collision_center=np.zeros(3, dtype=np.float32),
-            target_half_extents=np.full(3, 0.5, dtype=np.float32),
-            transition_clearance_m=0.12,
-        )
-        self.assertAlmostEqual(float(retargeted[0, 2]), 0.501, places=5)
-        self.assertAlmostEqual(float(retargeted[1, 2]), 1.3, places=5)
-        self.assertLess(float(shift[0]), 0.0)
-        self.assertAlmostEqual(float(shift[1]), 0.0, places=6)
 
     def test_place_success_uses_dataset_mesh_minus_z_as_up(self) -> None:
         cfg = CarryBoxConfig(
@@ -423,65 +387,18 @@ class CarryBoxTest(unittest.TestCase):
         np.testing.assert_allclose(velocity[:, 2], np.full(2, 7.5), atol=1.0e-5)
         np.testing.assert_allclose(goal[:, 2], np.full(2, 0.626), atol=1.0e-5)
 
-    def test_box_and_goal_are_explicit_fb_inputs_but_goal_stays_out_of_style_discriminator(self) -> None:
+    def test_box_extends_original_ufo_inputs_without_goal_or_custom_networks(self) -> None:
         cfg = build_fb_agent(device="cpu", compile=False, carry_box=True)
         arch = cfg.model.archi
         for network in (arch.actor, arch.f, arch.critic, arch.aux_critic, arch.b):
             self.assertIn("object_obs", network.input_filter.key)
-            self.assertIn("goal_obs", network.input_filter.key)
-        self.assertEqual(arch.discriminator.object_key, "object_obs")
-        self.assertFalse(arch.discriminator.condition_on_z)
-        self.assertEqual(cfg.model.task_latent_dim, 0)
-        self.assertIsNone(cfg.model.task_latent_key)
+            self.assertNotIn("goal_obs", network.input_filter.key)
+        self.assertEqual(arch.discriminator.name, "DiscriminatorArchi")
+        self.assertIn("object_obs", arch.discriminator.input_filter.key)
 
         legacy = build_fb_agent(device="cpu", compile=False, carry_box=False)
         self.assertNotIn("object_obs", legacy.model.archi.actor.input_filter.key)
-        self.assertNotIn("goal_obs", legacy.model.archi.actor.input_filter.key)
         self.assertNotIn("object_obs", legacy.model.obs_normalizer.normalizers)
-
-    def test_conditional_temporal_discriminator_gates_box_branch_for_walk(self) -> None:
-        obs_space = spaces.Dict(
-            {
-                "state": spaces.Box(-np.inf, np.inf, shape=(64,), dtype=np.float32),
-                "privileged_state": spaces.Box(-np.inf, np.inf, shape=(32,), dtype=np.float32),
-                "history_actor": spaces.Box(-np.inf, np.inf, shape=(372,), dtype=np.float32),
-                "last_action": spaces.Box(-np.inf, np.inf, shape=(29,), dtype=np.float32),
-                "object_obs": spaces.Box(-np.inf, np.inf, shape=(OBJECT_OBS_DIM,), dtype=np.float32),
-                "goal_obs": spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
-            }
-        )
-        discriminator = ConditionalTemporalDiscriminatorArchiConfig(
-            hidden_dim=64,
-            hidden_layers=2,
-            history_steps=4,
-            object_history_steps=OBJECT_HISTORY_STEPS,
-            object_frame_dim=OBJECT_FRAME_DIM,
-            condition_on_z=False,
-        ).build(obs_space, z_dim=16)
-        base_obs = {
-            "state": torch.randn(3, 64),
-            "privileged_state": torch.randn(3, 32),
-            "history_actor": torch.randn(3, 372),
-            "last_action": torch.randn(3, 29),
-            "object_obs": torch.zeros(3, OBJECT_OBS_DIM),
-            "goal_obs": torch.randn(3, 3),
-        }
-        z = torch.randn(3, 16)
-        walk_logits = discriminator.compute_logits(base_obs, z)
-        gated_noise = {key: value.clone() for key, value in base_obs.items()}
-        gated_noise["object_obs"][:, OBJECT_FRAME_DIM:] = torch.randn(3, OBJECT_OBS_DIM - OBJECT_FRAME_DIM)
-        torch.testing.assert_close(discriminator.task_gate(gated_noise), torch.zeros(3, 1))
-        torch.testing.assert_close(discriminator.compute_logits(gated_noise, z), walk_logits)
-
-        carry_obs = {key: value.clone() for key, value in base_obs.items()}
-        carry_obs["object_obs"] = torch.randn(3, OBJECT_OBS_DIM)
-        carry_obs["object_obs"][:, OBJECT_FRAME_DIM - 3 : OBJECT_FRAME_DIM] = 0.5
-        torch.testing.assert_close(discriminator.task_gate(carry_obs), torch.ones(3, 1))
-        self.assertFalse(torch.allclose(discriminator.compute_logits(carry_obs, z), walk_logits))
-        torch.testing.assert_close(
-            discriminator.compute_logits(carry_obs, z),
-            discriminator.compute_logits(carry_obs, torch.randn_like(z)),
-        )
 
     def test_source_priorities_preserve_lafan_carry_mix(self) -> None:
         buffer = TrajectoryDictBuffer(
@@ -509,40 +426,6 @@ class CarryBoxTest(unittest.TestCase):
         torch.testing.assert_close(expanded[:, :3], source[:, :3])
         torch.testing.assert_close(expanded[:, 3:6], torch.zeros(2, 3))
         torch.testing.assert_close(expanded[:, 6:], source[:, 3:])
-
-    def test_checkpoint_migration_does_not_reinterpret_legacy_object_fields(self) -> None:
-        prefix_dim = 2
-        z_dim = 4
-        source = torch.arange(prefix_dim + 19 + z_dim, dtype=torch.float32).reshape(1, -1)
-        goal_dim = 3
-        destination = torch.full((1, prefix_dim + OBJECT_OBS_DIM + goal_dim + z_dim), -1.0)
-        migrated = _copy_replacing_object_features(
-            source,
-            destination,
-            source_object_dim=19,
-            destination_object_dim=OBJECT_OBS_DIM,
-            source_goal_dim=0,
-            destination_goal_dim=goal_dim,
-            tail_count=z_dim,
-            zero_new_object=True,
-            map_legacy_pose=True,
-            map_legacy_goal=True,
-        )
-        self.assertIsNotNone(migrated)
-        torch.testing.assert_close(migrated[:, :prefix_dim], source[:, :prefix_dim])
-        torch.testing.assert_close(
-            migrated[:, prefix_dim : prefix_dim + 9], source[:, prefix_dim + 1 : prefix_dim + 10]
-        )
-        torch.testing.assert_close(
-            migrated[:, prefix_dim + 9 : prefix_dim + OBJECT_OBS_DIM],
-            torch.zeros(1, OBJECT_OBS_DIM - 9),
-        )
-        goal_start = prefix_dim + OBJECT_OBS_DIM
-        torch.testing.assert_close(
-            migrated[:, goal_start : goal_start + goal_dim],
-            source[:, prefix_dim + 16 : prefix_dim + 19],
-        )
-        torch.testing.assert_close(migrated[:, -z_dim:], source[:, -z_dim:])
 
     def test_reward_mode_can_infer_pick_latent_directly_from_carry_replay(self) -> None:
         class Dataset:
@@ -610,7 +493,7 @@ class CarryBoxTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "partial object trajectory"):
             validate_ufo_motion_dict(motion, "unit")
 
-    def test_uncertified_object_frames_are_not_reset_safe(self) -> None:
+    def test_object_motion_loader_needs_no_reset_certification_fields(self) -> None:
         frame_count = 3
         record = {
             "object_pos": np.zeros((frame_count, 3), dtype=np.float32),
@@ -621,39 +504,9 @@ class CarryBoxTest(unittest.TestCase):
             "object_goal_pos": np.zeros((frame_count, 3), dtype=np.float32),
         }
         loaded = _optional_object_state_from_motion_file(record, 0, frame_count, torch.float32)
-        torch.testing.assert_close(loaded["object_reset_valid"], torch.zeros(frame_count, 1))
-
-        record["object_reset_valid"] = np.asarray([[0.0], [1.0], [0.0]], dtype=np.float32)
-        loaded = _optional_object_state_from_motion_file(record, 0, frame_count, torch.float32)
-        torch.testing.assert_close(
-            loaded["object_reset_valid"], torch.tensor([[0.0], [1.0], [0.0]], dtype=torch.float32)
-        )
-
-    def test_reset_time_sampler_uses_only_certified_frames(self) -> None:
-        motion_lib = MotionLibBase.__new__(MotionLibBase)
-        motion_lib._device = "cpu"
-        motion_lib._reset_valid_frame_counts = torch.tensor([2, 0], dtype=torch.long)
-        motion_lib._reset_valid_frame_starts = torch.tensor([0, 2], dtype=torch.long)
-        motion_lib._reset_valid_frames = torch.tensor([1, 3], dtype=torch.long)
-        motion_lib._motion_dt = torch.tensor([0.1, 0.2], dtype=torch.float32)
-        sampled = motion_lib.sample_reset_time(torch.zeros(100, dtype=torch.long))
-        self.assertTrue(set(torch.round(sampled * 10).long().tolist()).issubset({1, 3}))
-        with self.assertRaisesRegex(ValueError, "no physics-safe reset frames"):
-            motion_lib.sample_reset_time(torch.tensor([1], dtype=torch.long))
-
-    def test_stage_reset_sampler_honors_available_phase_weights(self) -> None:
-        motion_lib = MotionLibBase.__new__(MotionLibBase)
-        motion_lib._device = "cpu"
-        motion_lib._stage_reset_valid_frame_counts = torch.tensor([[0, 2, 1, 0, 1]], dtype=torch.long)
-        motion_lib._stage_reset_valid_frame_starts = torch.tensor([[0, 0, 2, 3, 3]], dtype=torch.long)
-        motion_lib._stage_reset_valid_frames = torch.tensor([1, 3, 5, 7], dtype=torch.long)
-        motion_lib._motion_dt = torch.tensor([0.1], dtype=torch.float32)
-        times, stages = motion_lib.sample_stage_reset_time(
-            torch.zeros(100, dtype=torch.long),
-            (0.0, 1.0, 0.0, 0.0, 0.0),
-        )
-        self.assertTrue(torch.all(stages == 1))
-        self.assertTrue(set(torch.round(times * 10).long().tolist()).issubset({1, 3}))
+        self.assertNotIn("object_reset_valid", loaded)
+        self.assertNotIn("object_stage_reset_valid", loaded)
+        torch.testing.assert_close(loaded["object_phase"], torch.zeros(frame_count, 1))
 
 
 if __name__ == "__main__":

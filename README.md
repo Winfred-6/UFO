@@ -159,11 +159,14 @@ the 174 paired G1/large-box trajectories at 0.50/0.50. The checked-in box
 trajectories are already retargeted with G1 and are consumed at their native
 mesh scale, without another geometry resize or ground-trajectory shift.
 
-The actor receives the current box-relative pose and four past frames, plus an
-explicit heading-frame `goal_obs`. Actor, F, B, and critics consume the box and
-goal observations, while all 256 FB latent coordinates retain the same
-skill/reward semantics. The AMP branch judges robot style and robot/box
-synchronization without reading the goal or z as a shortcut.
+The extension keeps the original UFO/FB network semantics. Actor, F, B,
+critics, and the original z-conditioned discriminator receive one additional
+`object_obs` input containing the current box-relative pose and four past
+frames. There is no goal observation, task-command branch, custom
+discriminator, or reserved latent tail: all 256 FB coordinates are handled by
+the unmodified UFO latent path. Pick, transport, place, recovery, and safety
+terms use the existing auxiliary-reward critic. The target is internal reward
+metadata and never a policy observation.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./run_train.sh \
@@ -172,7 +175,7 @@ CUDA_VISIBLE_DEVICES=0 ./run_train.sh \
   --gpu-ids single \
   --num-envs 1024 \
   --num-env-steps 192000000 \
-  --work-dir runs/ufo_fb_g1_carry_box_native_goal_v4 \
+  --work-dir runs/ufo_fb_g1_carry_box_minimal_v1 \
   --data-manifest configs/data/lafan_g1_largebox.yaml \
   --init-from runs/ufo_fb_g1/checkpoint \
   --update-z-every-step 100 \
@@ -184,10 +187,11 @@ CUDA_VISIBLE_DEVICES=0 ./run_train.sh \
   --runtime-timing-every 25
 ```
 
-Use a fresh work directory and initialize only from the original locomotion
-checkpoint. Carry checkpoints that predate `goal_obs` remain playable but are
-not valid training initialization or resume sources. `--init-from` migrates
-compatible model weights only; optimizer, replay, and counters start fresh.
+Use a fresh work directory and initialize from the original locomotion
+checkpoint. `--init-from` preserves compatible UFO weights, inserts
+zero-initialized object-input columns, and starts optimizer, replay, and
+counters fresh. Do not resume carry checkpoints produced by the removed
+goal/task-command architecture.
 See [G1 carry-box training](README_BOX.md) for live source comparison, reward
 inference, and the eight-GPU profile.
 

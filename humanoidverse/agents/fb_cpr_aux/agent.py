@@ -200,35 +200,14 @@ class FBcprAuxAgent(FBcprAgent):
 
         # train the discriminator
         grad_penalty = self.cfg.train.grad_penalty_discriminator if self.cfg.train.grad_penalty_discriminator > 0 else None
-        mismatch_obs = None
-        mismatch_z = None
-        mismatch_coef = 0.0
-        if self.cfg.train.balanced_object_discriminator:
-            expert_disc_obs, expert_disc_z, expert_gate = self._balanced_discriminator_batch(
-                expert_obs, expert_z
-            )
-            train_disc_obs, train_disc_z, train_gate = self._balanced_discriminator_batch(train_obs, train_z)
-            mismatch_obs = self._mismatched_object_negative(expert_disc_obs, expert_gate)
-            mismatch_z = expert_disc_z
-            mismatch_coef = float(self.cfg.train.discriminator_mismatch_coef)
-        else:
-            expert_disc_obs, expert_disc_z = expert_obs, expert_z
-            train_disc_obs, train_disc_z = train_obs, train_z
-            expert_gate = train_gate = None
         with stage("discriminator", cuda=True):
             metrics = self.update_discriminator(
-                expert_obs=expert_disc_obs,
-                expert_z=expert_disc_z,
-                train_obs=train_disc_obs,
-                train_z=train_disc_z,
+                expert_obs=expert_obs,
+                expert_z=expert_z,
+                train_obs=train_obs,
+                train_z=train_z,
                 grad_penalty=grad_penalty,
-                mismatch_obs=mismatch_obs,
-                mismatch_z=mismatch_z,
-                mismatch_coef=mismatch_coef,
             )
-        if expert_gate is not None:
-            metrics["disc_expert_carry_fraction"] = expert_gate.float().mean()
-            metrics["disc_train_carry_fraction"] = train_gate.float().mean()
         self._diagnostic_assert_finite(metrics, "discriminator_metrics", step)
         self._diagnostic_assert_module(self._model._discriminator, "discriminator_after_update", step)
 

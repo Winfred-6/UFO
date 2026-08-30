@@ -396,45 +396,12 @@ def _prepare_tracking_playback_env_cfg(
     env_cfg: Any,
     *,
     model: torch.nn.Module | None = None,
-    emit_legacy_task_command: bool = False,
 ) -> tuple[Any, bool]:
-    """Disable training-only reset certification for exact playback.
+    """Align only the box observation width used by the checkpoint."""
 
-    Tracking inference resets to the explicitly selected source trajectory and
-    then advances through it frame by frame.  Requiring every inference PKL to
-    carry staged random-reset certification would prevent older checkpoints
-    and full-resolution source data from being inspected, even though that
-    sampler is never used by the tracking rollout.  The environment performs a
-    temporary random reset while it is being constructed, so the ordinary safe
-    mask must be disabled here as well: with one environment it can otherwise
-    randomly choose a motion which has staged frames but no legacy ground-reset
-    frames and fail before the selected tracking motion is installed.
-    """
-
-    carry_box = getattr(env_cfg, "carry_box", None)
-    if not bool(getattr(carry_box, "enabled", False)):
+    if model is None:
         return env_cfg, False
-    if model is not None:
-        return prepare_carry_inference_env_cfg(
-            env_cfg,
-            model,
-            disable_reset_certification=True,
-        )
-    needs_override = (
-        bool(getattr(carry_box, "stage_reset_curriculum", False))
-        or bool(getattr(carry_box, "require_safe_reset_mask", False))
-        or bool(getattr(carry_box, "emit_legacy_task_command", False)) != emit_legacy_task_command
-    )
-    if not needs_override:
-        return env_cfg, False
-    playback_carry_box = carry_box.model_copy(
-        update={
-            "stage_reset_curriculum": False,
-            "require_safe_reset_mask": False,
-            "emit_legacy_task_command": emit_legacy_task_command,
-        }
-    )
-    return env_cfg.model_copy(update={"carry_box": playback_carry_box}), True
+    return prepare_carry_inference_env_cfg(env_cfg, model)
 
 
 def run_tracking_inference(
@@ -492,14 +459,13 @@ def run_tracking_inference(
         disable_obs_noise=disable_obs_noise,
         max_episode_length_s=max_episode_length_s,
     )
-    env_cfg, disabled_staged_reset = _prepare_tracking_playback_env_cfg(
+    env_cfg, carry_obs_adapted = _prepare_tracking_playback_env_cfg(
         env_cfg,
         model=model,
     )
-    if disabled_staged_reset:
+    if carry_obs_adapted:
         print(
-            "[INFO] Tracking playback uses the source sequence directly; "
-            "disabled training-only reset certification.",
+            "[INFO] Adapted carry object-history width to the checkpoint.",
             flush=True,
         )
     wrapped_env, _ = env_cfg.build(num_envs=1)

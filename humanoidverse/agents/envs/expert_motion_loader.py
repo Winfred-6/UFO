@@ -6,7 +6,6 @@ import torch
 from humanoidverse.agents.envs.carry_box import (
     adaptive_carry_thresholds,
     box_collision_geometry,
-    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     object_observation,
@@ -110,13 +109,6 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
                 object_frames,
                 history_steps=int(env.carry_box_cfg.object_history_steps),
             )
-            goal_obs = carry_goal_observation(
-                base_quat_xyzw=base_quat,
-                object_pos=motion_res["object_pos"],
-                goal_pos=motion_res["object_goal_pos"],
-                valid=motion_res["object_valid"],
-                cfg=env.carry_box_cfg,
-            )
             hand_pos = ref_body_pos[:, env.hand_body_indices]
             hand_distance = hand_box_surface_geometry(
                 hand_pos=hand_pos,
@@ -177,7 +169,6 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
                 f"{env._motion_lib._motion_data_keys[i]}: {history_actor.shape[0]} vs {curr_motion_len}"
             )
             assert object_obs.shape[0] == curr_motion_len
-            assert goal_obs.shape[0] == curr_motion_len
         if add_history_noaction:
             assert history_noaction.shape[0] == curr_motion_len
 
@@ -194,7 +185,6 @@ def load_expert_trajectories_from_motion_lib(env, agent_cfg, device="cpu", add_h
         if build_history_actor:
             ep["observation"]["history_actor"] = history_actor
             ep["observation"]["object_obs"] = object_obs
-            ep["observation"]["goal_obs"] = goal_obs
             ep["aux_rewards"] = {
                 key: value.unsqueeze(-1)
                 for key, value in carry_aux_rewards.items()

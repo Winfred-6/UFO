@@ -18,8 +18,6 @@ OBJECT_TIME_SERIES_FIELDS = {
     "object_goal_pos": 3,
 }
 OPTIONAL_OBJECT_TIME_SERIES_FIELDS = {
-    "object_reset_valid": 1,
-    "object_stage_reset_valid": 1,
     "object_phase": 1,
 }
 
@@ -116,14 +114,6 @@ def validate_ufo_motion_dict(data: dict[str, dict[str, Any]] | Mapping[str, Mapp
             valid = np.asarray(motion["object_valid"])
             if np.any((valid < 0.0) | (valid > 1.0)):
                 _fail(source_name, motion_key, "object_valid values must be in [0, 1]")
-        if "object_reset_valid" in motion:
-            reset_valid = np.asarray(motion["object_reset_valid"])
-            if np.any((reset_valid < 0.0) | (reset_valid > 1.0)):
-                _fail(source_name, motion_key, "object_reset_valid values must be in [0, 1]")
-        if "object_stage_reset_valid" in motion:
-            reset_valid = np.asarray(motion["object_stage_reset_valid"])
-            if np.any((reset_valid < 0.0) | (reset_valid > 1.0)):
-                _fail(source_name, motion_key, "object_stage_reset_valid values must be in [0, 1]")
         if "object_phase" in motion:
             phase = np.asarray(motion["object_phase"])
             if np.any(phase != np.round(phase)) or np.any((phase < 0.0) | (phase > 4.0)):

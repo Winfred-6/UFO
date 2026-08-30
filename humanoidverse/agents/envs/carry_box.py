@@ -35,10 +35,6 @@ OBJECT_FRAME_DIM = 12
 # Keep the object branch on the same five-frame horizon.
 OBJECT_HISTORY_STEPS = 5
 OBJECT_OBS_DIM = OBJECT_FRAME_DIM * OBJECT_HISTORY_STEPS
-GOAL_OBS_DIM = 3
-# Kept only for loading pre-goal_obs checkpoints.  New training must not embed
-# this command in the tail of the FB latent.
-TASK_COMMAND_DIM = 3
 CARRY_STAGE_INACTIVE = 0
 CARRY_STAGE_APPROACH = 1
 CARRY_STAGE_PICKUP = 2
@@ -51,9 +47,9 @@ CARRY_STAGE_NAMES = ("inactive", "approach", "pickup", "transport", "place")
 def assert_native_reference_geometry(records) -> None:
     """Reject object trajectories produced by the obsolete resize pipeline.
 
-    ``sanitize_carry_box_data.py`` recorded ``object_geometry_retarget`` after
-    changing both the mesh proxy and the grounded trajectory.  Those files are
-    not interchangeable with the already-retargeted source PKL used by live
+    Legacy resized files record ``object_geometry_retarget`` after changing
+    both the mesh proxy and the grounded trajectory.  They are not
+    interchangeable with the already-retargeted source PKL used by live
     reference playback.
     """
 
@@ -83,9 +79,6 @@ class CarryBoxConfig(BaseConfig):
     # files which resized the box and shifted grounded object trajectories a
     # second time.
     require_native_reference_geometry: bool = True
-    # Certified RSI remains available as an explicit experiment, but it must
-    # never turn itself on when an older serialized config is loaded.
-    require_safe_reset_mask: bool = False
     fail_fast_diagnostics: bool = False
     diagnostic_max_object_linear_speed: float = 20.0
     diagnostic_max_object_angular_speed: float = 100.0
@@ -108,9 +101,6 @@ class CarryBoxConfig(BaseConfig):
     # hundreds of Warp/MuJoCo steps even though object observations are masked.
     park_distance: float = 100.0
     park_ground_clearance: float = 1.0e-3
-    # Retained only so older serialized configs still validate.  New code must
-    # not place a dynamic box below the ground plane.
-    park_depth: float = 5.0
     position_clip: float = 5.0
     linear_velocity_clip: float = 10.0
     angular_velocity_clip: float = 20.0
@@ -125,16 +115,7 @@ class CarryBoxConfig(BaseConfig):
     # robot temporal branch.  Inference entrypoints override this from the
     # checkpoint observation shape for older 48-D/four-frame policies.
     object_history_steps: int = OBJECT_HISTORY_STEPS
-    # TokenHSI-style reference-state initialization.  The source-level data
-    # mix already supplies locomotion examples, so these probabilities are
-    # normalized over object-bearing approach/pickup/transport/place frames.
-    stage_reset_curriculum: bool = False
-    stage_reset_probabilities: tuple[float, float, float, float] = (0.10, 0.20, 0.50, 0.20)
     upright_success_degrees: float = 30.0
-    # Inference-only compatibility for checkpoints which used task_command to
-    # overwrite z[-3:].  New checkpoints leave this disabled and consume
-    # goal_obs as an ordinary state-dependent observation instead.
-    emit_legacy_task_command: bool = False
 
     @pydantic.field_validator(
         "half_extents",
@@ -142,7 +123,6 @@ class CarryBoxConfig(BaseConfig):
         "visual_mesh_scale",
         "visual_up_axis",
         "hand_body_names",
-        "stage_reset_probabilities",
         mode="before",
     )
     @classmethod
@@ -169,18 +149,10 @@ class CarryBoxConfig(BaseConfig):
         return restored
 
     @pydantic.model_validator(mode="after")
-    def _validate_stage_curriculum(self):
+    def _validate_geometry_and_history(self):
         up_norm = sum(float(value) ** 2 for value in self.visual_up_axis) ** 0.5
         if abs(up_norm - 1.0) > 1.0e-6:
             raise ValueError("visual_up_axis must be a unit vector")
-        if len(self.stage_reset_probabilities) != CARRY_STAGE_COUNT - 1:
-            raise ValueError(
-                "stage_reset_probabilities must contain approach/pickup/transport/place weights"
-            )
-        if any((not float(value) >= 0.0) for value in self.stage_reset_probabilities):
-            raise ValueError("stage_reset_probabilities must be non-negative")
-        if sum(float(value) for value in self.stage_reset_probabilities) <= 0.0:
-            raise ValueError("stage_reset_probabilities must sum to a positive value")
         if int(self.object_history_steps) <= 0:
             raise ValueError("object_history_steps must be positive")
         return self
@@ -309,54 +281,6 @@ def object_observation(
     if observation.shape[-1] != OBJECT_FRAME_DIM:
         raise RuntimeError(f"Expected carry object frame dim={OBJECT_FRAME_DIM}, got {observation.shape[-1]}")
     return observation * mask
-
-
-def carry_goal_observation(
-    *,
-    base_quat_xyzw: torch.Tensor,
-    object_pos: torch.Tensor,
-    goal_pos: torch.Tensor,
-    valid: torch.Tensor,
-    cfg: CarryBoxConfig,
-) -> torch.Tensor:
-    """Encode the desired box displacement in the robot heading frame.
-
-    Unlike an FB latent, this value is allowed to change with state.  Keeping
-    it as a separate observation makes Bellman targets use the command from
-    the matching current/next state and leaves all 256 FB coordinates with one
-    consistent skill/reward semantics.
-    """
-
-    heading_inv = calc_heading_quat_inv(base_quat_xyzw, w_last=True)
-    goal_delta = my_quat_rotate(heading_inv, goal_pos - object_pos)
-    goal_delta = goal_delta.clamp(-cfg.position_clip, cfg.position_clip)
-    observation = goal_delta * valid.float().reshape(-1, 1)
-    if observation.shape[-1] != GOAL_OBS_DIM:
-        raise RuntimeError(f"Expected carry goal observation dim={GOAL_OBS_DIM}, got {observation.shape[-1]}")
-    return observation
-
-
-def task_latent_command(
-    *,
-    base_pos: torch.Tensor,
-    base_quat_xyzw: torch.Tensor,
-    goal_pos: torch.Tensor,
-    valid: torch.Tensor,
-    cfg: CarryBoxConfig,
-) -> torch.Tensor:
-    """Return the deprecated robot-to-goal command used by old checkpoints.
-
-    This exists solely so an old checkpoint can still be inspected.  New
-    training uses :func:`carry_goal_observation` and never writes into z.
-    """
-
-    heading_inv = calc_heading_quat_inv(base_quat_xyzw, w_last=True)
-    target_rel = my_quat_rotate(heading_inv, goal_pos - base_pos)
-    target_rel = target_rel.clamp(-cfg.position_clip, cfg.position_clip) / max(float(cfg.position_clip), 1.0e-6)
-    command = target_rel * valid.float().reshape(-1, 1)
-    if command.shape[-1] != TASK_COMMAND_DIM:
-        raise RuntimeError(f"Expected carry task command dim={TASK_COMMAND_DIM}, got {command.shape[-1]}")
-    return command
 
 
 def temporal_object_history(frames: torch.Tensor, history_steps: int = OBJECT_HISTORY_STEPS) -> torch.Tensor:

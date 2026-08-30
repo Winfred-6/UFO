@@ -139,58 +139,6 @@ def sanitize_object_ground_trajectory(
     return projected, linear_velocity, goal_pos, lift
 
 
-def retarget_object_collision_geometry(
-    object_pos: np.ndarray,
-    object_quat_xyzw: np.ndarray,
-    *,
-    source_collision_center: np.ndarray,
-    source_half_extents: np.ndarray,
-    target_collision_center: np.ndarray,
-    target_half_extents: np.ndarray,
-    transition_clearance_m: float = 0.12,
-    clearance_m: float = DEFAULT_GROUND_CLEARANCE_M,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Ground-anchor a resized object while preserving its airborne origin.
-
-    Scaling a mesh around its local origin makes a grounded smaller box float.
-    A global vertical offset would instead pull the held reference away from
-    the hands.  This function exactly preserves the source bottom height on
-    grounded frames, smoothly fades that correction through the pickup/place
-    transition, and leaves clearly airborne frames unchanged.
-    """
-
-    if not np.isfinite(transition_clearance_m) or transition_clearance_m <= 0.0:
-        raise ValueError("transition_clearance_m must be positive and finite")
-    source_bottom = oriented_box_min_corner_z(
-        object_pos,
-        object_quat_xyzw,
-        collision_center=source_collision_center,
-        half_extents=source_half_extents,
-    )
-    target_bottom = oriented_box_min_corner_z(
-        object_pos,
-        object_quat_xyzw,
-        collision_center=target_collision_center,
-        half_extents=target_half_extents,
-    )
-    source_ground = float(np.quantile(source_bottom, 0.02))
-    source_clearance = np.maximum(source_bottom - source_ground, 0.0)
-    blend = np.clip(source_clearance / float(transition_clearance_m), 0.0, 1.0)
-    blend = blend * blend * (3.0 - 2.0 * blend)
-    correction = ((source_bottom - target_bottom) * (1.0 - blend)).astype(np.float32)
-    retargeted = np.asarray(object_pos, dtype=np.float32).copy()
-    retargeted[:, 2] += correction
-    retargeted, projection = project_oriented_box_above_ground(
-        retargeted,
-        object_quat_xyzw,
-        collision_center=target_collision_center,
-        half_extents=target_half_extents,
-        clearance_m=clearance_m,
-    )
-    correction += projection
-    return retargeted, correction
-
-
 def classify_carry_stages(
     object_pos: np.ndarray,
     object_quat_xyzw: np.ndarray,

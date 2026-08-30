@@ -60,12 +60,6 @@ class FBModelConfig(BaseModelConfig):
     seq_length: int = 1
     actor_std: float = 0.2
     amp: bool = False
-    # Deprecated inference compatibility for pre-goal_obs carry checkpoints.
-    # New presets keep these values unset so project_z normalizes the complete
-    # latent and no physical command is assigned to arbitrary FB coordinates.
-    task_latent_key: str | None = None
-    task_latent_dim: int = 0
-    task_latent_scale: float = 1.0
 
     def build(self, obs_space, action_dim) -> "FBModel":
         return self.object_class(obs_space, action_dim, self)
@@ -86,12 +80,6 @@ class FBModel(BaseModel):
         arch = self.cfg.archi
         self.device = self.cfg.device
         self.amp_dtype = torch.bfloat16
-        if self.cfg.task_latent_dim < 0 or self.cfg.task_latent_dim >= arch.z_dim:
-            raise ValueError(
-                f"task_latent_dim must be in [0, {arch.z_dim}), got {self.cfg.task_latent_dim}"
-            )
-        if (self.cfg.task_latent_dim > 0) != (self.cfg.task_latent_key is not None):
-            raise ValueError("task_latent_key and a positive task_latent_dim must be configured together")
 
         # create networks
         self._backward_map = arch.b.build(obs_space, arch.z_dim)
@@ -126,7 +114,6 @@ class FBModel(BaseModel):
     @torch.no_grad()
     def actor(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, std: float):
         with autocast(device_type=self.device, dtype=self.amp_dtype, enabled=self.cfg.amp):
-            z = self.condition_task_latent(z, obs)
             return self._actor(self._normalize(obs), z, std)
 
     def sample_z(self, size: int, device: str = "cpu") -> torch.Tensor:
@@ -134,41 +121,9 @@ class FBModel(BaseModel):
         return self.project_z(z)
 
     def project_z(self, z):
-        task_dim = int(self.cfg.task_latent_dim)
-        if task_dim > 0:
-            style_dim = z.shape[-1] - task_dim
-            style = z[..., :style_dim]
-            if self.cfg.archi.norm_z:
-                style = math.sqrt(style_dim) * F.normalize(style, dim=-1)
-            task = torch.zeros_like(z[..., style_dim:])
-            return torch.cat([style, task], dim=-1)
         if self.cfg.archi.norm_z:
             z = math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
         return z
-
-    def condition_task_latent(
-        self,
-        z: torch.Tensor,
-        obs: torch.Tensor | dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Apply the deprecated z-tail adapter for legacy inference only."""
-
-        task_dim = int(self.cfg.task_latent_dim)
-        if task_dim <= 0:
-            return z
-        if not isinstance(obs, dict) or self.cfg.task_latent_key not in obs:
-            raise KeyError(f"Missing task-latent observation key {self.cfg.task_latent_key!r}")
-        command = obs[self.cfg.task_latent_key]
-        if command.shape[-1] != task_dim:
-            raise ValueError(f"Expected task command dim={task_dim}, got {command.shape[-1]}")
-        if z.shape[0] == 1 and command.shape[0] != 1:
-            z = z.expand(command.shape[0], -1)
-        if z.shape[0] != command.shape[0]:
-            raise ValueError(f"Task command batch={command.shape[0]} does not match z batch={z.shape[0]}")
-        base = self.project_z(z)
-        command = command.to(device=z.device, dtype=z.dtype).clamp(-1.0, 1.0)
-        command = command * float(self.cfg.task_latent_scale)
-        return torch.cat([base[..., :-task_dim], command], dim=-1)
 
     def act(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor, mean: bool = True) -> torch.Tensor:
         dist = self.actor(obs, z, self.cfg.actor_std)

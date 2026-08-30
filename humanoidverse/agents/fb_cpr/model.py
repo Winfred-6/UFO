@@ -12,12 +12,12 @@ from torch.amp import autocast
 
 from ..fb.model import FBModel, FBModelArchiConfig, FBModelConfig
 from ..nn_filter_models import DiscriminatorFilterArchiConfig, ForwardFilterArchiConfig
-from ..nn_models import ConditionalTemporalDiscriminatorArchiConfig, DiscriminatorArchiConfig, ForwardArchiConfig
+from ..nn_models import DiscriminatorArchiConfig, ForwardArchiConfig
 
 
 class FBcprModelArchiConfig(FBModelArchiConfig):
     critic: ForwardArchiConfig | ForwardFilterArchiConfig = pydantic.Field(ForwardArchiConfig(), discriminator="name")
-    discriminator: DiscriminatorArchiConfig | ConditionalTemporalDiscriminatorArchiConfig | DiscriminatorFilterArchiConfig = pydantic.Field(
+    discriminator: DiscriminatorArchiConfig | DiscriminatorFilterArchiConfig = pydantic.Field(
         DiscriminatorArchiConfig(), discriminator="name"
     )
 

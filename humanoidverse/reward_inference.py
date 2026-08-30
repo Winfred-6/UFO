@@ -454,9 +454,7 @@ def run_reward_inference(
     model.to(device)
     model.eval()
     model_obs_spaces = getattr(getattr(model, "obs_space", None), "spaces", {})
-    carry_conditioned_model = "goal_obs" in model_obs_spaces or int(
-        getattr(model.cfg, "task_latent_dim", 0)
-    ) > 0
+    carry_conditioned_model = "object_obs" in model_obs_spaces
     if requested_tasks is None and carry_conditioned_model:
         tasks = [*tasks, *CARRY_REWARD_COMPONENTS.keys()]
         task_support_mode += " + carry object/goal observations"
@@ -535,7 +533,6 @@ def run_reward_inference(
     env_cfg, _carry_compatibility = prepare_carry_inference_env_cfg(
         env_cfg,
         model,
-        disable_reset_certification=True,
     )
     wrapped_env, _ = env_cfg.build(num_envs=1)
     renderer = None
@@ -658,8 +655,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar=("X", "Y", "Z"),
         help=(
-            "Optional world-frame target xyz for carry reward rollouts. New checkpoints expose it through "
-            "goal_obs without overwriting z; legacy checkpoints retain their compatibility adapter."
+            "Optional world-frame target xyz used by carry reward evaluation. "
+            "The target affects reward computation only and is not a policy observation."
         ),
     )
     add_bool_arg(parser, "--export-onnx", False, "Export ONNX next to the checkpoint before inference.")

@@ -37,8 +37,6 @@ class FBcprAgentTrainConfig(FBAgentTrainConfig):
     # Commented out as example but not useful
     # grad_penalty_obs_weight: float | None = None  # must be in (0,1)
     weight_decay_discriminator: float = 0.0
-    balanced_object_discriminator: bool = False
-    discriminator_mismatch_coef: float = 0.0
 
 
 class FBcprAgentConfig(BaseConfig):
@@ -173,55 +171,6 @@ class FBcprAgent(FBAgent):
                 dim=0,
             )  # batch x d
         return z_expert
-
-    @torch.no_grad()
-    def _balanced_discriminator_batch(
-        self,
-        obs: dict[str, torch.Tensor],
-        z: torch.Tensor,
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Resample an exact 50/50 walk/carry discriminator mini-batch."""
-
-        discriminator = self._model._discriminator
-        if not hasattr(discriminator, "task_gate"):
-            raise TypeError("balanced_object_discriminator requires a conditional discriminator with task_gate()")
-        gate = discriminator.task_gate(obs).squeeze(-1) > 0.5
-        walk_weights = (~gate).float()
-        carry_weights = gate.float()
-        walk_count = self.cfg.train.batch_size // 2
-        carry_count = self.cfg.train.batch_size - walk_count
-        indices = torch.cat(
-            [
-                torch.multinomial(walk_weights, walk_count, replacement=True),
-                torch.multinomial(carry_weights, carry_count, replacement=True),
-            ],
-            dim=0,
-        )
-        balanced_obs = tree_map(lambda value: value[indices], obs)
-        balanced_z = z[indices]
-        balanced_gate = torch.cat(
-            [
-                torch.zeros(walk_count, dtype=torch.bool, device=self.device),
-                torch.ones(carry_count, dtype=torch.bool, device=self.device),
-            ]
-        )
-        return balanced_obs, balanced_z, balanced_gate
-
-    @torch.no_grad()
-    def _mismatched_object_negative(
-        self,
-        expert_obs: dict[str, torch.Tensor],
-        expert_gate: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Pair each carry robot window with another carry box window."""
-
-        object_key = self._model._discriminator.cfg.object_key
-        mismatch = {key: value for key, value in expert_obs.items()}
-        boxes = expert_obs[object_key].clone()
-        carry_start = expert_gate.shape[0] // 2
-        boxes[carry_start:] = torch.roll(boxes[carry_start:].clone(), shifts=1, dims=0)
-        mismatch[object_key] = boxes
-        return mismatch
 
     def update(self, replay_buffer, step: int) -> Dict[str, torch.Tensor]:
         expert_batch = replay_buffer["expert_slicer"].sample(self.cfg.train.batch_size)
@@ -393,9 +342,6 @@ class FBcprAgent(FBAgent):
         train_obs: torch.Tensor | dict[str, torch.Tensor],
         train_z: torch.Tensor,
         grad_penalty: float | None,
-        mismatch_obs: torch.Tensor | dict[str, torch.Tensor] | None = None,
-        mismatch_z: torch.Tensor | None = None,
-        mismatch_coef: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         with autocast(device_type=self.device, dtype=self._model.amp_dtype, enabled=self.cfg.model.amp):
             expert_logits = self._model._discriminator.compute_logits(obs=expert_obs, z=expert_z)
@@ -404,18 +350,6 @@ class FBcprAgent(FBAgent):
             expert_loss = -torch.nn.functional.logsigmoid(expert_logits)
             unlabeled_loss = torch.nn.functional.softplus(unlabeled_logits)
             loss = torch.mean(expert_loss + unlabeled_loss)
-
-            mismatch_loss = None
-            if mismatch_obs is not None:
-                if mismatch_z is None or mismatch_coef <= 0.0:
-                    raise ValueError("mismatch_obs requires mismatch_z and a positive mismatch_coef")
-                mismatch_logits = self._model._discriminator.compute_logits(obs=mismatch_obs, z=mismatch_z)
-                # The balanced batch is ordered [walk, carry].  Only its carry
-                # half is a robot/box mismatch negative; walk remains governed
-                # by the regular policy-negative term above.
-                carry_start = mismatch_logits.shape[0] // 2
-                mismatch_loss = torch.nn.functional.softplus(mismatch_logits[carry_start:]).mean()
-                loss = loss + float(mismatch_coef) * mismatch_loss
 
             if grad_penalty is not None:
                 wgan_gp = self.gradient_penalty_wgan(expert_obs, expert_z, train_obs, train_z)
@@ -432,8 +366,6 @@ class FBcprAgent(FBAgent):
                 "disc_expert_loss": expert_loss.detach().mean().detach(),
                 "disc_train_loss": unlabeled_loss.detach().mean().detach(),
             }
-            if mismatch_loss is not None:
-                output_metrics["disc_mismatch_loss"] = mismatch_loss.detach()
             if grad_penalty is not None:
                 output_metrics["disc_wgan_gp_loss"] = wgan_gp.detach()
         return output_metrics

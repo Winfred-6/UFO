@@ -72,14 +72,12 @@ def _optional_object_state_from_motion_file(curr_file, start, end, dtype):
         "object_ang_vel": torch.zeros((frame_count, 3), dtype=dtype),
         "object_valid": torch.zeros((frame_count, 1), dtype=dtype),
         "object_goal_pos": torch.zeros((frame_count, 3), dtype=dtype),
-        "object_reset_valid": torch.ones((frame_count, 1), dtype=dtype),
-        "object_stage_reset_valid": torch.ones((frame_count, 1), dtype=dtype),
         "object_phase": torch.zeros((frame_count, 1), dtype=dtype),
     }
     defaults["object_quat"][:, 3] = 1.0
     if "object_valid" not in curr_file:
         return defaults
-    optional_fields = {"object_reset_valid", "object_stage_reset_valid", "object_phase"}
+    optional_fields = {"object_phase"}
     required_fields = tuple(key for key in defaults if key not in optional_fields)
     for key in required_fields:
         default = defaults[key]
@@ -89,29 +87,6 @@ def _optional_object_state_from_motion_file(curr_file, start, end, dtype):
         if value.shape != default.shape:
             raise ValueError(f"{key} must have shape {tuple(default.shape)}, got {tuple(value.shape)}")
         defaults[key] = value
-    if "object_reset_valid" in curr_file:
-        value = to_torch(curr_file["object_reset_valid"]).clone()[start:end].to(dtype=dtype)
-        if value.shape != defaults["object_reset_valid"].shape:
-            raise ValueError(
-                "object_reset_valid must have shape "
-                f"{tuple(defaults['object_reset_valid'].shape)}, got {tuple(value.shape)}"
-            )
-        defaults["object_reset_valid"] = value
-    else:
-        # Object-bearing data must be explicitly certified before it can be
-        # used as a dynamic-physics reset.  Object-free legacy motions remain
-        # valid at every frame.
-        defaults["object_reset_valid"] = 1.0 - defaults["object_valid"]
-    if "object_stage_reset_valid" in curr_file:
-        value = to_torch(curr_file["object_stage_reset_valid"]).clone()[start:end].to(dtype=dtype)
-        if value.shape != defaults["object_stage_reset_valid"].shape:
-            raise ValueError(
-                "object_stage_reset_valid must have shape "
-                f"{tuple(defaults['object_stage_reset_valid'].shape)}, got {tuple(value.shape)}"
-            )
-        defaults["object_stage_reset_valid"] = value
-    else:
-        defaults["object_stage_reset_valid"] = defaults["object_reset_valid"].clone()
     if "object_phase" in curr_file:
         value = to_torch(curr_file["object_phase"]).clone()[start:end].to(dtype=dtype)
         if value.shape != defaults["object_phase"].shape:
@@ -489,8 +464,6 @@ class MotionLibBase():
         object_goal_pos0 = self.object_goal_pos[f0l]
         object_goal_pos1 = self.object_goal_pos[f1l]
         object_valid = self.object_valid[f0l]
-        object_reset_valid = self.object_reset_valid[f0l]
-        object_stage_reset_valid = self.object_stage_reset_valid[f0l]
         object_phase = self.object_phase[f0l]
         object_pos = (1.0 - blend) * object_pos0 + blend * object_pos1
         object_goal_pos = (1.0 - blend) * object_goal_pos0 + blend * object_goal_pos1
@@ -555,8 +528,6 @@ class MotionLibBase():
             "object_ang_vel": object_ang_vel.clone(),
             "object_valid": object_valid.clone(),
             "object_goal_pos": object_goal_pos.clone(),
-            "object_reset_valid": object_reset_valid.clone(),
-            "object_stage_reset_valid": object_stage_reset_valid.clone(),
             "object_phase": object_phase.clone(),
             "motion_source_id": self._loaded_motion_source_ids[motion_ids].clone(),
         })
@@ -615,8 +586,6 @@ class MotionLibBase():
                 "object_ang_vel",
                 "object_valid",
                 "object_goal_pos",
-                "object_reset_valid",
-                "object_stage_reset_valid",
                 "object_phase",
             ):
                 if object_field in self.__dict__:
@@ -642,8 +611,6 @@ class MotionLibBase():
             "object_ang_vel": [],
             "object_valid": [],
             "object_goal_pos": [],
-            "object_reset_valid": [],
-            "object_stage_reset_valid": [],
             "object_phase": [],
         }
 
@@ -766,58 +733,6 @@ class MotionLibBase():
         lengths_shifted = lengths.roll(1)
         lengths_shifted[0] = 0
         self.length_starts = lengths_shifted.cumsum(0)
-        reset_valid_frames = []
-        reset_valid_counts = []
-        motion_has_object = []
-        for motion_index in range(self._num_motions):
-            frame_start = int(self.length_starts[motion_index].item())
-            frame_count = int(self._motion_num_frames[motion_index].item())
-            frame_end = frame_start + frame_count
-            relative_valid = (self.object_reset_valid[frame_start:frame_end, 0] > 0.5).nonzero(
-                as_tuple=False
-            ).flatten()
-            reset_valid_frames.append(relative_valid)
-            reset_valid_counts.append(int(relative_valid.numel()))
-            motion_has_object.append(bool(torch.any(self.object_valid[frame_start:frame_end, 0] > 0.5).item()))
-        self._reset_valid_frame_counts = torch.tensor(reset_valid_counts, device=self._device, dtype=torch.long)
-        reset_valid_starts = self._reset_valid_frame_counts.roll(1)
-        reset_valid_starts[0] = 0
-        self._reset_valid_frame_starts = reset_valid_starts.cumsum(0)
-        self._reset_valid_frames = (
-            torch.cat(reset_valid_frames).to(self._device)
-            if any(reset_valid_counts)
-            else torch.empty(0, device=self._device, dtype=torch.long)
-        )
-        self._motion_has_object = torch.tensor(motion_has_object, device=self._device, dtype=torch.bool)
-        stage_reset_valid_frames = []
-        stage_reset_valid_counts = []
-        num_carry_stages = 5
-        for motion_index in range(self._num_motions):
-            frame_start = int(self.length_starts[motion_index].item())
-            frame_count = int(self._motion_num_frames[motion_index].item())
-            frame_end = frame_start + frame_count
-            phases = self.object_phase[frame_start:frame_end, 0].round().long()
-            certified = self.object_stage_reset_valid[frame_start:frame_end, 0] > 0.5
-            for stage in range(num_carry_stages):
-                relative_valid = (certified & (phases == stage)).nonzero(as_tuple=False).flatten()
-                stage_reset_valid_frames.append(relative_valid)
-                stage_reset_valid_counts.append(int(relative_valid.numel()))
-        self._stage_reset_valid_frame_counts = torch.tensor(
-            stage_reset_valid_counts,
-            device=self._device,
-            dtype=torch.long,
-        ).reshape(self._num_motions, num_carry_stages)
-        stage_starts = self._stage_reset_valid_frame_counts.reshape(-1).roll(1)
-        stage_starts[0] = 0
-        self._stage_reset_valid_frame_starts = stage_starts.cumsum(0).reshape(
-            self._num_motions,
-            num_carry_stages,
-        )
-        self._stage_reset_valid_frames = (
-            torch.cat(stage_reset_valid_frames).to(self._device)
-            if any(stage_reset_valid_counts)
-            else torch.empty(0, device=self._device, dtype=torch.long)
-        )
         self.motion_ids = torch.arange(len(motions), dtype=torch.long, device=self._device)
         motion = motions[0]
         self.num_bodies = self.num_joints
@@ -945,51 +860,6 @@ class MotionLibBase():
         motion_time = phase * motion_len
         return motion_time.to(self._device)
 
-    def sample_reset_time(self, motion_ids):
-        """Sample exact frames certified for dynamic object initialization."""
-
-        counts = self._reset_valid_frame_counts[motion_ids]
-        if torch.any(counts <= 0):
-            bad_ids = motion_ids[counts <= 0].detach().cpu().tolist()
-            raise ValueError(f"Motions have no physics-safe reset frames: loaded_motion_ids={bad_ids[:20]}")
-        offsets = torch.floor(torch.rand(motion_ids.shape, device=self._device) * counts.float()).long()
-        packed_indices = self._reset_valid_frame_starts[motion_ids] + offsets
-        frame_indices = self._reset_valid_frames[packed_indices]
-        return frame_indices.float() * self._motion_dt[motion_ids]
-
-    def sample_stage_reset_time(self, motion_ids, stage_probabilities):
-        """Sample certified reference frames with a requested phase mixture."""
-
-        probabilities = torch.as_tensor(
-            stage_probabilities,
-            device=self._device,
-            dtype=torch.float32,
-        )
-        if probabilities.shape != (self._stage_reset_valid_frame_counts.shape[1],):
-            raise ValueError(
-                "stage_probabilities must have one weight per stage, got "
-                f"shape={tuple(probabilities.shape)}"
-            )
-        if torch.any(~torch.isfinite(probabilities)) or torch.any(probabilities < 0.0):
-            raise ValueError("stage_probabilities must be finite and non-negative")
-        counts = self._stage_reset_valid_frame_counts[motion_ids]
-        available = counts > 0
-        weights = available.float() * probabilities.unsqueeze(0)
-        missing_weight = weights.sum(dim=1) <= 0.0
-        if torch.any(missing_weight):
-            weights[missing_weight] = available[missing_weight].float()
-        if torch.any(weights.sum(dim=1) <= 0.0):
-            bad_ids = motion_ids[weights.sum(dim=1) <= 0.0].detach().cpu().tolist()
-            raise ValueError(f"Motions have no certified staged reset frames: loaded_motion_ids={bad_ids[:20]}")
-
-        stage_ids = torch.multinomial(weights, num_samples=1, replacement=True).squeeze(-1)
-        selected_counts = counts.gather(1, stage_ids[:, None]).squeeze(1)
-        offsets = torch.floor(torch.rand(motion_ids.shape, device=self._device) * selected_counts.float()).long()
-        starts = self._stage_reset_valid_frame_starts[motion_ids, stage_ids]
-        packed_indices = starts + offsets
-        frame_indices = self._stage_reset_valid_frames[packed_indices]
-        return frame_indices.float() * self._motion_dt[motion_ids], stage_ids
-    
     def sample_motions(self, n):
         source_ids = self._motion_source_ids[self._curr_motion_ids]
         motion_ids = self._sample_indices_with_source_mix(

@@ -29,7 +29,6 @@ import humanoidverse
 from humanoidverse.agents.base import BaseConfig
 from humanoidverse.agents.envs.carry_box import (
     CARRY_STAGE_COUNT,
-    CARRY_STAGE_NAMES,
     CARRY_STAGE_TRANSPORT,
     CarryBoxConfig,
     OBJECT_FRAME_DIM,
@@ -37,12 +36,10 @@ from humanoidverse.agents.envs.carry_box import (
     assert_native_reference_geometry,
     box_collision_geometry,
     build_carry_box_scene_parts,
-    carry_goal_observation,
     carry_task_terms,
     hand_box_surface_geometry,
     object_observation,
     parked_box_local_position,
-    task_latent_command,
 )
 from humanoidverse.envs.env_utils.history_handler import HistoryHandler as HVHistoryHandler
 from humanoidverse.envs.motion_observations import compute_humanoid_observations_max
@@ -852,42 +849,6 @@ class HumanoidVerseMjlabCore:
         if self.carry_box_enabled and self.carry_box_cfg.require_native_reference_geometry:
             assert_native_reference_geometry(self._motion_lib._motion_data_list)
         self._motion_lib.load_motions_for_training(max_num_seqs=self.num_envs)
-        if self.carry_box_enabled and self.carry_box_cfg.require_safe_reset_mask:
-            object_motions = self._motion_lib._motion_has_object
-            use_stage_curriculum = bool(self.carry_box_cfg.stage_reset_curriculum)
-            if use_stage_curriculum:
-                stage_counts = self._motion_lib._stage_reset_valid_frame_counts[:, 1:CARRY_STAGE_COUNT]
-                safe_object_motions = object_motions & (stage_counts.sum(dim=1) > 0)
-            else:
-                stage_counts = None
-                safe_object_motions = object_motions & (self._motion_lib._reset_valid_frame_counts > 0)
-            if not torch.any(object_motions):
-                raise ValueError("carry_box task loaded no object-bearing motions")
-            if not torch.any(safe_object_motions):
-                raise ValueError(
-                    "carry_box motions contain no certified reset frames for the configured curriculum; "
-                    "run the carry-box staged physics certification before training"
-                )
-            if use_stage_curriculum:
-                stage_summary = ", ".join(
-                    f"{CARRY_STAGE_NAMES[stage]}={int(stage_counts[:, stage - 1].sum().item())}"
-                    for stage in range(1, CARRY_STAGE_COUNT)
-                )
-                logger.info(
-                    "[carry-box] staged physics-safe reset motions={safe}/{total}, frames=({summary})".format(
-                        safe=int(safe_object_motions.sum().item()),
-                        total=int(object_motions.sum().item()),
-                        summary=stage_summary,
-                    )
-                )
-            else:
-                logger.info(
-                    "[carry-box] physics-safe reset motions={safe}/{total}, reset_frames={frames}".format(
-                        safe=int(safe_object_motions.sum().item()),
-                        total=int(object_motions.sum().item()),
-                        frames=int(self._motion_lib._reset_valid_frame_counts[safe_object_motions].sum().item()),
-                    )
-                )
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_start_times = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self.motion_len = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
@@ -917,24 +878,6 @@ class HumanoidVerseMjlabCore:
         if len(env_ids) == 0:
             return
         self.motion_ids[env_ids] = self._motion_lib.sample_motions(len(env_ids))
-        safe_object_resets = self.carry_box_enabled and self.carry_box_cfg.require_safe_reset_mask
-        staged_object_resets = safe_object_resets and bool(self.carry_box_cfg.stage_reset_curriculum)
-        if safe_object_resets and not self.is_evaluating:
-            for _ in range(64):
-                selected = self.motion_ids[env_ids]
-                if staged_object_resets:
-                    valid_count = self._motion_lib._stage_reset_valid_frame_counts[
-                        selected, 1:CARRY_STAGE_COUNT
-                    ].sum(dim=1)
-                else:
-                    valid_count = self._motion_lib._reset_valid_frame_counts[selected]
-                invalid = self._motion_lib._motion_has_object[selected] & (valid_count <= 0)
-                if not torch.any(invalid):
-                    break
-                invalid_env_ids = env_ids[invalid]
-                self.motion_ids[invalid_env_ids] = self._motion_lib.sample_motions(len(invalid_env_ids))
-            else:
-                raise RuntimeError("Could not sample a carry-box motion with a certified physics-safe reset frame")
         self.motion_len[env_ids] = self._motion_lib.get_motion_length(self.motion_ids[env_ids])
         if self.is_evaluating and not self.config.enforce_randomize_motion_start_eval:
             self.motion_start_times[env_ids] = 0.0
@@ -942,28 +885,8 @@ class HumanoidVerseMjlabCore:
                 self.object_reset_stage[env_ids] = 0
         else:
             self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
-            if safe_object_resets:
-                selected = self.motion_ids[env_ids]
-                object_mask = self._motion_lib._motion_has_object[selected]
-                if torch.any(object_mask):
-                    object_env_ids = env_ids[object_mask]
-                    if staged_object_resets:
-                        stage_probabilities = torch.as_tensor(
-                            (0.0, *self.carry_box_cfg.stage_reset_probabilities),
-                            device=self.device,
-                            dtype=torch.float32,
-                        )
-                        reset_times, reset_stages = self._motion_lib.sample_stage_reset_time(
-                            selected[object_mask],
-                            stage_probabilities,
-                        )
-                        self.motion_start_times[object_env_ids] = reset_times
-                        self.object_reset_stage[object_env_ids] = reset_stages
-                    else:
-                        self.motion_start_times[object_env_ids] = self._motion_lib.sample_reset_time(selected[object_mask])
-                        self.object_reset_stage[object_env_ids] = 0
-                if self.carry_box_enabled:
-                    self.object_reset_stage[env_ids[~object_mask]] = 0
+            if self.carry_box_enabled:
+                self.object_reset_stage[env_ids] = 0
 
     def _randomize_default_dof_pos_offset(self, env_ids: torch.Tensor) -> None:
         if bool(self.config.domain_rand.get("randomize_default_dof_pos", False)):
@@ -1143,24 +1066,6 @@ class HumanoidVerseMjlabCore:
             base_quat_xyzw=self.base_quat,
             object_pos=self.object_pos,
             object_quat_xyzw=self.object_quat,
-            valid=self.object_valid,
-            cfg=self.carry_box_cfg,
-        )
-
-    def _goal_observation(self) -> torch.Tensor:
-        return carry_goal_observation(
-            base_quat_xyzw=self.base_quat,
-            object_pos=self.object_pos,
-            goal_pos=self.object_goal_pos,
-            valid=self.object_valid,
-            cfg=self.carry_box_cfg,
-        )
-
-    def _legacy_task_latent_command(self) -> torch.Tensor:
-        return task_latent_command(
-            base_pos=self.robot_root_states[:, :3],
-            base_quat_xyzw=self.base_quat,
-            goal_pos=self.object_goal_pos,
             valid=self.object_valid,
             cfg=self.carry_box_cfg,
         )
@@ -1370,9 +1275,6 @@ class HumanoidVerseMjlabCore:
         }
         if self.carry_box_enabled:
             obs["object_obs"] = self._object_observation()
-            obs["goal_obs"] = self._goal_observation()
-            if self.carry_box_cfg.emit_legacy_task_command:
-                obs["task_command"] = self._legacy_task_latent_command()
         if include_last_action:
             obs["last_action"] = raw_obs["actions"]
         obs["time"] = self.episode_length_buf.unsqueeze(-1)

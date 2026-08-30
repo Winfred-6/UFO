@@ -17,7 +17,7 @@ from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from ..buffers.trajectory import TrajectoryDictBufferMultiDim
-from ..envs.carry_box import carry_goal_observation, object_observation, temporal_object_history
+from ..envs.carry_box import object_observation, temporal_object_history
 from ..envs.humanoidverse_mjlab import HumanoidVerseMjlabConfig
 from .base import BaseEvalConfig, extract_model
 from humanoidverse.utils.reference_observations import reference_base_ang_vel
@@ -301,13 +301,6 @@ def get_backward_observation(env, motion_id, include_last_action, velocity_multi
         g1env_obs["object_obs"] = temporal_object_history(
             object_frames,
             history_steps=int(env.carry_box_cfg.object_history_steps),
-        )
-        g1env_obs["goal_obs"] = carry_goal_observation(
-            base_quat_xyzw=base_quat,
-            object_pos=motion_state["object_pos"],
-            goal_pos=motion_state["object_goal_pos"],
-            valid=motion_state["object_valid"],
-            cfg=env.carry_box_cfg,
         )
 
     return g1env_obs, ref_dict

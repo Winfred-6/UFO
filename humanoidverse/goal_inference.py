@@ -199,7 +199,6 @@ def run_goal_inference(
     env_cfg, _carry_compatibility = prepare_carry_inference_env_cfg(
         env_cfg,
         model,
-        disable_reset_certification=True,
     )
     wrapped_env, _ = env_cfg.build(num_envs=1)
     env = wrapped_env._env

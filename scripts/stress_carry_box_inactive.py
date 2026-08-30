@@ -48,7 +48,7 @@ def main() -> None:
         task="carry_box",
         fail_fast_diagnostics=True,
     )
-    carry_cfg = cfg.env.carry_box.model_copy(update={"require_safe_reset_mask": False})
+    carry_cfg = cfg.env.carry_box
     cfg = cfg.model_copy(update={"env": cfg.env.model_copy(update={"carry_box": carry_cfg})})
     env, _ = cfg.env.build(num_envs=args.num_envs)
     core = env.base_env

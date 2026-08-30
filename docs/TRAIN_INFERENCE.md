@@ -83,12 +83,12 @@ trajectories are balanced at 0.50/0.50. The paired data is already retargeted
 with G1 and is used at the native OBJ scale without another geometry resize or
 ground-trajectory shift.
 
-The actor receives current plus four past frames of relative box position,
-6-D rotation, and size, together with an explicit heading-frame `goal_obs`.
-Actor, F, B, and critics consume `object_obs` and `goal_obs`; the complete
-256-dimensional z keeps one FB skill/reward meaning. The gated temporal AMP
-discriminator handles walk style and carry robot/box synchronization without
-reading goal coordinates or z as shortcuts.
+The extension keeps the original UFO model and latent semantics. Actor, F, B,
+critics, and the original z-conditioned discriminator consume one additional
+`object_obs` input containing current plus four past frames of relative box
+position, 6-D rotation, and size. Targets remain internal auxiliary-reward
+metadata: there is no `goal_obs`, task-command branch, custom discriminator,
+or reserved z tail.
 
 Initialize model weights from the existing locomotion run while starting a new
 optimizer, replay, and step counter:
@@ -100,7 +100,7 @@ CUDA_VISIBLE_DEVICES=0 ./run_train.sh \
   --gpu-ids single \
   --num-envs 1024 \
   --num-env-steps 192000000 \
-  --work-dir runs/ufo_fb_g1_carry_box_native_goal_v4 \
+  --work-dir runs/ufo_fb_g1_carry_box_minimal_v1 \
   --data-manifest configs/data/lafan_g1_largebox.yaml \
   --init-from runs/ufo_fb_g1/checkpoint \
   --update-z-every-step 100 \
@@ -116,16 +116,16 @@ The repository includes the processed full and near-10-second G1/large-box
 PKLs under `humanoidverse/data/`; `configs/data/lafan_g1_largebox.yaml` points
 to those portable native paths and does not depend on a machine-local source
 folder. Formal training rejects object data marked as having undergone another
-geometry retarget. Use a fresh work directory and initialize only from
-`runs/ufo_fb_g1/checkpoint`; carry checkpoints without `goal_obs` are
-inference-only.
+geometry retarget. Use a fresh work directory and initialize from
+`runs/ufo_fb_g1/checkpoint`; do not resume checkpoints produced by the removed
+goal/task-command architecture.
 
 For one 32 GiB RTX 5090, keep the 5.12-million-frame replay in host RAM. This
 machine profile keeps the already-tested 1024 environments and samples a timing
 breakdown every 25 rollout iterations:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_native_goal_v4 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
+CUDA_VISIBLE_DEVICES=0 ./run_train.sh --agent fb --task carry_box --gpu-ids single --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_minimal_v1 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cpu --buffer-prefetch 2 --buffer-pin-memory-threads 2 --gpu-native-rollout --runtime-timing-every 25
 ```
 
 For eight H200 GPUs, each rank can keep its replay directly on its local GPU.
@@ -142,11 +142,11 @@ instead, recognizing that this shortens each rank's local replay horizon.
 First verify the eight-worker/NCCL path with the bounded smoke profile:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_native_goal_v4_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --smoke --work-dir /tmp/ufo_h200x8_carry_minimal_v1_smoke --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 1
 ```
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_native_goal_v4_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./run_train.sh --agent fb --task carry_box --gpu-ids all --num-envs 1024 --num-env-steps 192000000 --work-dir runs/ufo_fb_g1_carry_box_minimal_v1_h200x8 --data-manifest configs/data/lafan_g1_largebox.yaml --init-from runs/ufo_fb_g1/checkpoint --update-z-every-step 100 --buffer-size 5120000 --buffer-storage cuda --buffer-prefetch 0 --buffer-pin-memory-threads 0 --gpu-native-rollout --runtime-timing-every 100
 ```
 
 The timing output reports `env_step_gpu_ms`, `cpu_copy_ms`, `replay_extend_ms`,
@@ -186,7 +186,7 @@ For live MJLab playback of a carry trajectory (no video or ONNX export):
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 uv run python -m humanoidverse.tracking_inference \
-  --model-folder runs/ufo_fb_g1_carry_box_native_goal_v4 \
+  --model-folder runs/ufo_fb_g1_carry_box_minimal_v1 \
   --data-manifest configs/data/lafan_g1_largebox.yaml \
   --dataset g1_largebox \
   --motion-list 0 \

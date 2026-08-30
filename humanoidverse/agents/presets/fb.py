@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from humanoidverse.agents.envs.carry_box import OBJECT_FRAME_DIM, OBJECT_HISTORY_STEPS
 from humanoidverse.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig, FBcprAuxAgentTrainConfig
 from humanoidverse.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
 from humanoidverse.agents.nn_filters import DictInputFilterConfig
 from humanoidverse.agents.nn_models import (
     ActorArchiConfig,
     BackwardArchiConfig,
-    ConditionalTemporalDiscriminatorArchiConfig,
     DiscriminatorArchiConfig,
     ForwardArchiConfig,
     RewardNormalizerConfig,
@@ -102,14 +100,14 @@ def build_fb_agent(
     forward_keys = ["state", "privileged_state", "last_action", "history_actor"]
     actor_keys = ["state", "last_action", "history_actor"]
     backward_keys = ["state", "privileged_state"]
+    discriminator_keys = ["state", "privileged_state"]
     if carry_box:
-        # goal_obs is state-dependent (heading-frame box-to-goal), so it must
-        # travel through ordinary observations instead of replacing z[-3:].
-        forward_keys.extend(["object_obs", "goal_obs"])
-        actor_keys.extend(["object_obs", "goal_obs"])
-        # Object-aware B makes carry reward inference identifiable instead of
-        # relying on correlations in robot pose alone.
-        backward_keys.extend(["object_obs", "goal_obs"])
+        # Extend the original UFO state with box history.  The FB latent,
+        # network classes, and discriminator semantics remain unchanged.
+        forward_keys.append("object_obs")
+        actor_keys.append("object_obs")
+        backward_keys.append("object_obs")
+        discriminator_keys.append("object_obs")
 
     return FBcprAuxAgentConfig(
         name="FBcprAuxAgent",
@@ -159,25 +157,13 @@ def build_fb_agent(
                         name="DictInputFilterConfig", key=forward_keys
                     ),
                 ),
-                discriminator=(
-                    ConditionalTemporalDiscriminatorArchiConfig(
-                        name="ConditionalTemporalDiscriminatorArchi",
-                        hidden_dim=1024,
-                        hidden_layers=3,
-                        history_steps=4,
-                        object_history_steps=OBJECT_HISTORY_STEPS,
-                        object_frame_dim=OBJECT_FRAME_DIM,
-                        condition_on_z=False,
-                    )
-                    if carry_box
-                    else DiscriminatorArchiConfig(
-                        name="DiscriminatorArchi",
-                        hidden_dim=1024,
-                        hidden_layers=3,
-                        input_filter=DictInputFilterConfig(
-                            name="DictInputFilterConfig", key=["state", "privileged_state"]
-                        ),
-                    )
+                discriminator=DiscriminatorArchiConfig(
+                    name="DiscriminatorArchi",
+                    hidden_dim=1024,
+                    hidden_layers=3,
+                    input_filter=DictInputFilterConfig(
+                        name="DictInputFilterConfig", key=discriminator_keys
+                    ),
                 ),
                 aux_critic=ForwardArchiConfig(
                     name="ForwardArchi",
@@ -204,7 +190,6 @@ def build_fb_agent(
                         if carry_box
                         else {}
                     ),
-                    **({"goal_obs": IdentityNormalizerConfig(name="IdentityNormalizerConfig")} if carry_box else {}),
                 },
                 allow_mismatching_keys=True,
             ),
@@ -246,8 +231,6 @@ def build_fb_agent(
             relabel_ratio=0.8,
             grad_penalty_discriminator=10.0,
             weight_decay_discriminator=0.0,
-            balanced_object_discriminator=carry_box,
-            discriminator_mismatch_coef=0.5 if carry_box else 0.0,
             lr_aux_critic=0.0003 * lr_scale,
             reg_coeff_aux=0.02,
             aux_critic_pessimism_penalty=0.5,
